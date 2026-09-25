@@ -1,0 +1,11 @@
+# Build do ESP-IDF
+build/
+
+# Ambiente Python
+venv/
+__pycache__/
+
+# Espressif IDF Libraries 
+managed_components/
+# Testes no PC (test/host)
+build-host/

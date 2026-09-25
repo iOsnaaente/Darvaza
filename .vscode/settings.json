@@ -1,0 +1,20 @@
+{
+    "idf.currentSetup": "/home/iosnaaente/esp/esp-idf",
+    "idf.openOcdConfigs": [
+        "board/esp32s3-builtin.cfg"
+    ],
+    "idf.customExtraVars": {
+        "IDF_PATH": "/home/iosnaaente/esp/esp-idf",
+        "IDF_TOOLS_PATH": "/home/iosnaaente/.espressif",
+        "IDF_PYTHON_ENV_PATH": "/home/iosnaaente/.espressif/python_env/idf5.5_py3.12_env",
+        "IDF_TARGET": "esp32s3"
+    },
+    "clangd.path": "/home/iosnaaente/.espressif/tools/esp-clang/esp-19.1.2_20250312/esp-clang/bin/clangd",
+    "clangd.arguments": [
+      "--background-index",
+      "--query-driver=**",
+      "--compile-commands-dir=/home/iosnaaente/Darvaza/build"
+    ],
+    "idf.port": "/dev/ttyACM0",
+    "idf.flashType": "UART"
+}

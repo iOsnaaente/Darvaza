@@ -1,0 +1,7 @@
+# Cabe em 2 MB de flash (o que o sdkconfig diz hoje). Com flash maior,
+# aumente 'anims' (e o CONFIG_ESPTOOLPY_FLASHSIZE).
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x6000
+phy_init, data, phy,     0xf000,   0x1000
+factory,  app,  factory, 0x10000,  0x100000
+anims,    data, 0x40,    0x110000, 0xF0000
