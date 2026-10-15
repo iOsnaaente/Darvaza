@@ -1,0 +1,105 @@
+# Target
+CONFIG_IDF_TARGET="esp32p4"
+# O chip da placa é rev v1.3. O IDF 5.5 compila por padrão para rev >= 3.01,
+# que é outro hardware: sem isto o bootloader recusa o chip.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+
+# Modelos de rosto (esp-dl) rodam bem mais rápido com -O2.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# PSRAM — buffers da câmera (3 x 1,8 MB), quadro da IA, JPEGs e tensores dos
+# modelos vivem na SPIRAM
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+# 200 MHz PSRAM is gated behind the experimental-features flag; without it
+# the choice silently falls back to 20 MHz, which is far too slow to absorb
+# a full-rate camera frame and every capture comes back empty.
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+CONFIG_SPIRAM_SPEED_200M=y
+# DMA da câmera para a PSRAM passa pelo L2: linhas maiores = rajadas maiores.
+CONFIG_CACHE_L2_CACHE_256KB=y
+CONFIG_CACHE_L2_CACHE_LINE_128B=y
+# Código e rodata (onde ficam os pesos dos modelos) copiados para a PSRAM no
+# boot: inferência lê pesos mais rápido, e gravar cadastros na flash não
+# congela os dois cores esperando a cache.
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+
+# 16 MB flash on this board (esptool flash_id: GD c8/4018). The upstream
+# example assumes 32 MB; a header larger than the real chip fails at boot.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# App de 8 MB (modelos no rodata) + FAT "storage" com os cadastros de rosto.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# esp_video: MIPI-CSI capture device + ISP pipeline
+CONFIG_ESP_VIDEO_ENABLE_MIPI_CSI_VIDEO_DEVICE=y
+CONFIG_ESP_VIDEO_ENABLE_ISP_VIDEO_DEVICE=y
+CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER=y
+
+# IMX708 add-on driver + auto-detect; IMX219 off so it doesn't probe 0x10
+CONFIG_CAMERA_IMX708=y
+CONFIG_CAMERA_IMX708_AUTO_DETECT_MIPI_INTERFACE_SENSOR=y
+CONFIG_CAMERA_IMX219=n
+# Modo 1 = 1280x720 @ 28 fps: recorte central (56% do campo), sem escala.
+# Rostos maiores na imagem, JPEG menor (mais fps no Wi-Fi) e IA mais rápida
+# que no modo 0 (1920x1080).
+CONFIG_CAMERA_IMX708_MIPI_IF_FORMAT_INDEX_DEFAULT=1
+
+# OV5647 (a câmera que a Waveshare manda com os kits P4, chip-ID 0x5647 no
+# I2C 0x36). Habilitada junto: o esp_video tenta a IMX708 e, se ela não
+# responder, a OV5647. 1280x960 com binning = campo de visão inteiro, 45 fps.
+# Sem motor de foco: o "Failed to detect camera motor" no log é esperado.
+# O tuning do ISP dela o esp_cam_sensor registra sozinho (ver abaixo).
+CONFIG_CAMERA_OV5647=y
+CONFIG_CAMERA_OV5647_AUTO_DETECT_MIPI_INTERFACE_SENSOR=y
+CONFIG_CAMERA_OV5647_MIPI_RAW10_1280X960_BINNING_45FPS=y
+CONFIG_CAMERA_OV5647_MIPI_DEFAULT_FMT_RAW10_1280X960_BINNING_45FPS=y
+
+# Autofoco (motor DW9807 no I2C 0x0c). Sem ele a lente fica parada e a imagem
+# sai borrada. Os três últimos precisam estar todos ligados: falta de qualquer
+# um desliga o AF sem aviso.
+CONFIG_CAM_MOTOR_DW9807=y
+CONFIG_CAM_MOTOR_DW9807_AUTO_DETECT=y
+CONFIG_ESP_IPA_AF_ALGORITHM=y
+CONFIG_ESP_VIDEO_ENABLE_CAMERA_MOTOR_CONTROLLER=y
+CONFIG_ESP_VIDEO_ISP_PIPELINE_CONTROL_CAMERA_MOTOR=y
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# ---------------------------------------------------------------------------
+# Wi-Fi pelo ESP32-C6 (esp_wifi_remote + esp_hosted por SDIO). Os pinos
+# P4<->C6 da placa (CLK 18, CMD 19, D0-D3 14-17, reset 54) são os padrões do
+# esp_hosted para o P4 - conferido no esquemático do ESP32-P4-Module.
+CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
+
+# O esp_hosted reclama de "bus level jitters" a 100 Hz: toda espera no SDIO
+# arredonda para um tick de 10 ms.
+CONFIG_FREERTOS_HZ=1000
+
+# O mempool SDIO do esp_hosted sai da RAM interna; no tamanho padrão não cabe
+# junto da pilha da câmera e a placa dá assert em prvCreateIdleTasks, antes do
+# app_main. Não use MEMPOOL_PREFER_SPIRAM: faz bootar mas trava envios grandes.
+CONFIG_ESP_HOSTED_SDIO_TX_Q_SIZE=10
+CONFIG_ESP_HOSTED_SDIO_RX_Q_SIZE=10
+
+# Janela TCP maior: o padrão (4 x MSS) limita um stream muito antes do rádio.
+CONFIG_LWIP_TCP_WND_DEFAULT=64800
+# Buffer de ENVIO pequeno de propósito (8 x MSS). Com 64800 o P4 despejava
+# ~45 segmentos de uma vez; o C6 (firmware de fábrica, sem controle de fluxo)
+# descartava o excesso e o TCP só retransmitia no RTO (1,5 s): o vídeo
+# congelava ~1 s a cada 1-3 s. Limitar o que fica "no ar" evita as perdas.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=11520
+# Contadores de pacotes do esp_hosted ("stats: STA ... drop[N]" a cada 10 s):
+# desligados para o terminal mostrar só o tracking. Ligue para diagnosticar
+# perdas: CONFIG_ESP_HOSTED_PKT_STATS=y
+CONFIG_LWIP_MAX_SOCKETS=16
+
+# Navegadores mandam cabeçalhos maiores que os 512 bytes padrão (erro 431).
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
+# O tuning padrão da OV5647 liga autofoco (para módulos com motor no GPIO0 do
+# sensor); sem motor, esp_ipa_af_init dá assert no boot. cfg/ov5647_noaf.json
+# é o padrão do esp_cam_sensor 2.6 sem a seção "af".
+CONFIG_CAMERA_OV5647_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE=y
+CONFIG_CAMERA_OV5647_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE_PATH="cfg/ov5647_noaf.json"
+CONFIG_CAMERA_OV5647_ENABLE_MOTOR_BY_GPIO0=n

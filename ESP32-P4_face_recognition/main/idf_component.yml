@@ -1,0 +1,8 @@
+dependencies:
+  idf: ">=5.4"
+  espressif/esp_video: "^2.4"
+  mushbraindave/esp_cam_sensor_imx: "^0.4.0"
+  # "*" deixa o solver olhar as 0.1.x, que puxam BSP + LVGL com if-clauses em
+  # LV_USE_* e derrubam o configure ("Missing required kconfig option")
+  espressif/human_face_recognition: "~0.3.2"
+  espressif/button: "^4.1"

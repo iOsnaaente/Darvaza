@@ -1,0 +1,120 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#include <ctype.h>
+#include <string.h>
+#include "overlay.h"
+
+/* Fonte 5x7 clássica (glcdfont): 5 colunas por glifo, bit 0 = linha de cima. */
+static const uint8_t FONT_DIGITS[10][5] = {
+    {0x3E, 0x51, 0x49, 0x45, 0x3E}, {0x00, 0x42, 0x7F, 0x40, 0x00},
+    {0x42, 0x61, 0x51, 0x49, 0x46}, {0x21, 0x41, 0x45, 0x4B, 0x31},
+    {0x18, 0x14, 0x12, 0x7F, 0x10}, {0x27, 0x45, 0x45, 0x45, 0x39},
+    {0x3C, 0x4A, 0x49, 0x49, 0x30}, {0x01, 0x71, 0x09, 0x05, 0x03},
+    {0x36, 0x49, 0x49, 0x49, 0x36}, {0x06, 0x49, 0x49, 0x29, 0x1E},
+};
+
+static const uint8_t FONT_UPPER[26][5] = {
+    {0x7E, 0x11, 0x11, 0x11, 0x7E}, {0x7F, 0x49, 0x49, 0x49, 0x36}, /* A B */
+    {0x3E, 0x41, 0x41, 0x41, 0x22}, {0x7F, 0x41, 0x41, 0x22, 0x1C}, /* C D */
+    {0x7F, 0x49, 0x49, 0x49, 0x41}, {0x7F, 0x09, 0x09, 0x09, 0x01}, /* E F */
+    {0x3E, 0x41, 0x49, 0x49, 0x7A}, {0x7F, 0x08, 0x08, 0x08, 0x7F}, /* G H */
+    {0x00, 0x41, 0x7F, 0x41, 0x00}, {0x20, 0x40, 0x41, 0x3F, 0x01}, /* I J */
+    {0x7F, 0x08, 0x14, 0x22, 0x41}, {0x7F, 0x40, 0x40, 0x40, 0x40}, /* K L */
+    {0x7F, 0x02, 0x0C, 0x02, 0x7F}, {0x7F, 0x04, 0x08, 0x10, 0x7F}, /* M N */
+    {0x3E, 0x41, 0x41, 0x41, 0x3E}, {0x7F, 0x09, 0x09, 0x09, 0x06}, /* O P */
+    {0x3E, 0x41, 0x51, 0x21, 0x5E}, {0x7F, 0x09, 0x19, 0x29, 0x46}, /* Q R */
+    {0x46, 0x49, 0x49, 0x49, 0x31}, {0x01, 0x01, 0x7F, 0x01, 0x01}, /* S T */
+    {0x3F, 0x40, 0x40, 0x40, 0x3F}, {0x1F, 0x20, 0x40, 0x20, 0x1F}, /* U V */
+    {0x3F, 0x40, 0x38, 0x40, 0x3F}, {0x63, 0x14, 0x08, 0x14, 0x63}, /* W X */
+    {0x07, 0x08, 0x70, 0x08, 0x07}, {0x61, 0x51, 0x49, 0x45, 0x43}, /* Y Z */
+};
+
+static const uint8_t GLYPH_PERCENT[5]  = {0x23, 0x13, 0x08, 0x64, 0x62};
+static const uint8_t GLYPH_MINUS[5]    = {0x08, 0x08, 0x08, 0x08, 0x08};
+static const uint8_t GLYPH_DOT[5]      = {0x00, 0x60, 0x60, 0x00, 0x00};
+static const uint8_t GLYPH_COLON[5]    = {0x00, 0x36, 0x36, 0x00, 0x00};
+static const uint8_t GLYPH_QUESTION[5] = {0x02, 0x01, 0x51, 0x09, 0x06};
+
+#define GLYPH_W 5
+#define GLYPH_H 7
+#define ADVANCE 6   /* 5 colunas + 1 de espaço */
+
+static const uint8_t *glyph(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return FONT_DIGITS[c - '0'];
+    }
+    c = (char)toupper((unsigned char)c);
+    if (c >= 'A' && c <= 'Z') {
+        return FONT_UPPER[c - 'A'];
+    }
+    switch (c) {
+    case '%': return GLYPH_PERCENT;
+    case '-': return GLYPH_MINUS;
+    case '.': return GLYPH_DOT;
+    case ':': return GLYPH_COLON;
+    case '?': return GLYPH_QUESTION;
+    default:  return NULL;
+    }
+}
+
+static inline int clampi(int v, int lo, int hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+void overlay_fill(const overlay_fb_t *fb, int x0, int y0, int x1, int y1, uint16_t color)
+{
+    if (x1 < 0 || y1 < 0 || x0 >= fb->w || y0 >= fb->h || x0 > x1 || y0 > y1) {
+        return;
+    }
+    x0 = clampi(x0, 0, fb->w - 1);
+    x1 = clampi(x1, 0, fb->w - 1);
+    y0 = clampi(y0, 0, fb->h - 1);
+    y1 = clampi(y1, 0, fb->h - 1);
+    for (int y = y0; y <= y1; y++) {
+        uint16_t *row = fb->px + (size_t)y * fb->w;
+        for (int x = x0; x <= x1; x++) {
+            row[x] = color;
+        }
+    }
+}
+
+void overlay_rect(const overlay_fb_t *fb, int x0, int y0, int x1, int y1, int thick, uint16_t color)
+{
+    overlay_fill(fb, x0, y0, x1, y0 + thick - 1, color);
+    overlay_fill(fb, x0, y1 - thick + 1, x1, y1, color);
+    overlay_fill(fb, x0, y0, x0 + thick - 1, y1, color);
+    overlay_fill(fb, x1 - thick + 1, y0, x1, y1, color);
+}
+
+void overlay_text(const overlay_fb_t *fb, int x, int y, const char *s, int scale, uint16_t color)
+{
+    for (; *s; s++, x += ADVANCE * scale) {
+        const uint8_t *g = glyph(*s);
+        if (!g) {
+            continue;
+        }
+        for (int col = 0; col < GLYPH_W; col++) {
+            for (int row = 0; row < GLYPH_H; row++) {
+                if (g[col] & (1u << row)) {
+                    int px = x + col * scale;
+                    int py = y + row * scale;
+                    overlay_fill(fb, px, py, px + scale - 1, py + scale - 1, color);
+                }
+            }
+        }
+    }
+}
+
+int overlay_text_width(const char *s, int scale)
+{
+    int n = (int)strlen(s);
+    return n ? (n * ADVANCE - 1) * scale : 0;
+}
+
+int overlay_text_height(int scale)
+{
+    return GLYPH_H * scale;
+}

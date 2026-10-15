@@ -1,0 +1,14 @@
+dependencies:
+  espressif/esp_video: ^2.4
+  idf: '>=5.4'
+  # 0.4.0: modo 1280x720 e correções de quadro corrompido / sensor travado.
+  mushbraindave/esp_cam_sensor_imx: ^0.4.0
+  # Modelos de detecção e de características de rosto (puxa human_face_detect
+  # e esp-dl). "~0.3.2" e não "*": com "*" o solver olha as 0.1.x, que puxam
+  # BSP + LVGL e derrubam o configure.
+  espressif/human_face_recognition: ~0.3.2
+  # O P4 não tem rádio: estes levam as chamadas esp_wifi_* ao ESP32-C6 por SDIO.
+  # esp_hosted fica na linha 2.12: é a combinação já testada com o firmware de
+  # fábrica do C6 nas placas Waveshare (a 3.x nunca foi testada contra ele).
+  espressif/esp_hosted: ~2.12.12
+  espressif/esp_wifi_remote: ^1.6

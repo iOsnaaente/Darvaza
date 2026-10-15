@@ -1,0 +1,11 @@
+{
+    "idf.currentSetup": "/home/iosnaaente/esp/v5.5.4/esp-idf",
+    "idf.customExtraVars": {
+        "IDF_PATH": "/home/iosnaaente/esp/v5.5.4/esp-idf",
+        "IDF_TOOLS_PATH": "/home/iosnaaente/.espressif",
+        "IDF_PYTHON_ENV_PATH": "/home/iosnaaente/.espressif/python_env/idf5.5_py3.12_env",
+        "IDF_TARGET": "esp32p4"
+    },
+    "idf.port": "/dev/ttyACM0",
+    "idf.flashType": "UART"
+}
