@@ -5,23 +5,27 @@
  * Placa: Waveshare ESP32-P4-Module-DEV-KIT. O P4 não tem rádio: o Wi-Fi é o
  * ESP32-C6 da placa, falando com o P4 por SDIO (esp_hosted + esp_wifi_remote).
  *
- *   GET  /              página: vídeo com caixas e IDs, cadastro, apagar
- *   GET  /stream        MJPEG (multipart/x-mixed-replace): <img>, VLC, ffplay
- *   GET  /capture.jpg   um quadro JPEG, com as caixas
+ *   GET  /              página: caixas ao vivo, recorte de cada rosto, dados
+ *   GET  /events        Server-Sent Events (text/event-stream):
+ *                         faces - caixas e IDs, a cada quadro analisado
+ *                         crop  - JPEG (base64) só da caixa de cada rosto
+ *                         stats - o mesmo JSON do /status, 1 por segundo
+ *   GET  /capture.jpg   uma foto do quadro inteiro, com as caixas (sob demanda)
  *   GET  /status        contadores, rostos na imagem e IDs cadastrados (JSON)
  *   GET  /quality?q=N   qualidade JPEG ao vivo (1..100)
  *   POST /enroll        cadastra o maior rosto da imagem; devolve o ID
  *   POST /delete?id=N   apaga um cadastro (id=all apaga todos)
  *
  * Sensor: IMX708 (1280x720) ou OV5647 (1280x960) - o esp_video usa o que
- * responder no I2C. Pipeline: CSI -> ISP (RGB565) -> [cópia p/ IA, se livre] ->
- * caixas + IDs desenhados no quadro -> encoder JPEG de hardware -> "último
- * quadro" publicado. Cada espectador copia o último quadro e envia no ritmo do
- * seu link; se o link for mais lento que a câmera, quadros são pulados.
+ * responder no I2C. Pipeline: CSI -> ISP (RGB565) -> IA (no próprio buffer da
+ * câmera) -> recorte de cada caixa -> encoder JPEG de hardware -> "últimos
+ * recortes" publicados. O quadro inteiro não vai para a rede: a página recebe
+ * as caixas (poucos bytes, a cada quadro) e desenha ela mesma, e recebe a
+ * imagem só de dentro das caixas. Cada espectador envia no ritmo do seu link;
+ * se ele for mais lento que a IA, resultados intermediários são pulados.
  *
- * A IA (face.cpp) roda no core 1, no ritmo dela; o vídeo nunca espera por ela
- * e usa sempre o resultado mais recente. Por isso as caixas seguem um rosto em
- * movimento com um atraso de um ciclo de IA.
+ * A IA (face.cpp) roda no core 1, no ritmo dela; a captura nunca espera por
+ * ela e usa sempre o resultado mais recente.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +50,7 @@
 #include "driver/i2c_master.h"
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
+#include "mbedtls/base64.h"
 #include "face.h"
 #include "overlay.h"
 #include "wifi.h"
@@ -63,32 +68,35 @@
 
 #define CAM_DEV_PATH        ESP_VIDEO_MIPI_CSI_DEVICE_NAME  /* /dev/video0 */
 /* 5: a detecção segura um buffer (~20 ms, sem cópia), o reconhecimento pode
- * segurar outro (~120 ms), a captura um terceiro pelo JPEG da web (~17 ms), e o
- * sensor precisa de pelo menos mais um livre para não perder quadro. */
+ * segurar outro (~120 ms), a captura um terceiro pelos recortes (~2 ms por
+ * rosto), e o sensor precisa de pelo menos mais um livre para não perder
+ * quadro. */
 #define BUFFER_COUNT        5
 
-/* Medido com a OV5647 em 1280x960: q60 ~115 KB/quadro, q35 ~60 KB, q25 ~45 KB.
- * O link do C6 entrega uns 6-8 Mbit/s, então q35 dá ~2x os fps de q60 e a
- * imagem continua boa para ver e reconhecer rostos. */
-#define JPEG_QUALITY_DEFAULT 35
+/* Vale para os recortes e para a foto. Medido no quadro inteiro (1280x960):
+ * ~115 KB em q60, ~60 KB em q35. Um recorte de 256x256 tem 1/19 dessa área,
+ * então fica em poucos KB mesmo em q60. */
+#define JPEG_QUALITY_DEFAULT 60
 
-/* Teto de quadros JPEG por segundo para a web. A captura, a cópia para a IA
- * e o JPEG rodam no mesmo laço: sem teto, o JPEG (~17 ms por quadro) segura a
- * câmera em ~25 fps e a IA passa a receber quadros mais velhos. Com o teto, a
- * captura fica na taxa da câmera e o tracking ganha - a web é secundária. */
-#define STREAM_MAX_FPS      10
+/* Recortes por segundo para a web. As caixas vão a cada quadro analisado; a
+ * imagem de dentro delas não precisa de tanto, e cada recorte custa banda. */
+#define CROP_MAX_FPS        15
+/* Lado maior do recorte enviado (múltiplo de 16). Rosto maior que isso vai
+ * reduzido pulando pixels: a banda fica limitada mesmo com o rosto colado. */
+#define CROP_MAX_PX         256
 
 /* Cada espectador custa uma task, um buffer em PSRAM e um socket; e todos
  * dividem a mesma banda. */
 #define MAX_VIEWERS         2
-#define STREAM_TASK_STACK   6144
+#define EVENTS_TASK_STACK   6144
+#define EVENTS_POLL_MS      5       /* de quanto em quanto o espectador olha se há novidade */
+#define EVENT_TEXT_CAP      2048    /* evento faces ou stats */
+#define STATS_PERIOD_US     (1000 * 1000)
 
-/* Sem quadro novo por esse tempo, o espectador é desconectado. */
+/* Quanto a foto (/capture.jpg) espera um quadro novo. */
 #define FRAME_WAIT_US       (3 * 1000 * 1000)
 
-#define PART_BOUNDARY       "imx708frame"
-
-/* ---- Desenho das caixas ---------------------------------------------------- */
+/* ---- Caixas (as desenhadas na foto; a página desenha as dela) --------------- */
 #define BOX_THICK           3
 #define LABEL_SCALE         3       /* fonte 5x7 x3 = 21 px de altura */
 #define BOX_MAX_AGE_MS      600     /* IA parada há mais que isso: sem caixas */
@@ -141,10 +149,10 @@ static size_t s_frame_len;
 static jpeg_encoder_handle_t s_jpeg;
 
 /*
- * Dois buffers JPEG: o encoder escreve em s_work e, pronto, troca com
- * s_latest sob o lock. Leitores copiam s_latest sob o mesmo lock (uma cópia
- * de ~50 KB, < 1 ms) e enviam a cópia sem segurar nada - um envio lento
- * nunca trava a câmera.
+ * Foto do quadro inteiro, dois buffers JPEG: o encoder escreve em s_work e,
+ * pronto, troca com s_latest sob o lock. Quem pediu copia s_latest sob o
+ * mesmo lock e envia a cópia sem segurar nada - um envio lento nunca trava a
+ * câmera.
  */
 static uint8_t *s_work, *s_latest;
 static size_t s_jpeg_cap;
@@ -152,35 +160,52 @@ static size_t s_latest_len;
 static volatile uint32_t s_latest_seq;
 static SemaphoreHandle_t s_lock;
 
+/*
+ * Recortes: cada caixa é copiada (contígua, como o encoder pede) para
+ * s_crop_rgb, vira JPEG em s_crop_jpg e entra em s_crops_work como um evento
+ * SSE pronto ("event: crop", JPEG em base64). O conjunto de todos os rostos
+ * do quadro troca com s_crops_latest sob s_crops_lock, como a foto acima: o
+ * base64 é feito uma vez, não uma vez por espectador.
+ */
+static uint16_t *s_crop_rgb;
+static uint8_t *s_crop_jpg;
+static size_t s_crop_jpg_cap;
+static char *s_crops_work, *s_crops_latest;
+static size_t s_crops_cap;
+static size_t s_crops_len;
+static volatile uint32_t s_crops_seq;
+static SemaphoreHandle_t s_crops_lock;
+
 static atomic_int s_quality = JPEG_QUALITY_DEFAULT;
-/* Só codifica JPEG quando alguém quer quadros (stream ou foto). A câmera e a
- * IA rodam sempre: AE/AWB/AF ficam convergidos e o log serial continua
- * mostrando quem foi reconhecido mesmo sem ninguém na página. */
-static atomic_int s_consumers;
+/* Só faz JPEG quando alguém quer: recortes com espectadores no /events, a
+ * foto quando pedida. A câmera e a IA rodam sempre: AE/AWB/AF ficam
+ * convergidos e o terminal continua mostrando os rostos sem ninguém na
+ * página. */
+static atomic_int s_photo_waiters;
 static atomic_int s_viewers;
 
 static struct {
     uint32_t captured;
-    uint32_t encoded;
+    uint32_t crop_sets;       /* conjuntos de recortes publicados */
+    uint32_t crop_bytes;      /* tamanho do último conjunto (eventos com base64) */
+    uint32_t crop_us;         /* último conjunto: cópia + JPEG + base64 */
+    uint32_t photos;
     uint32_t encode_failed;
-    uint32_t encode_us;
-    uint32_t jpeg_bytes;
-    uint32_t sent;
-    uint64_t bytes_sent;
+    uint64_t bytes_sent;      /* tudo que saiu pelo /events */
 } s_stats;
 
-/* ---- Captura + caixas + JPEG ---------------------------------------------- */
+/* ---- Captura, recortes e foto --------------------------------------------- */
 
 static void draw_faces(uint8_t *frame)
 {
-    face_box_t boxes[FACE_MAX_BOXES];
-    size_t n = face_get_boxes(boxes, FACE_MAX_BOXES, BOX_MAX_AGE_MS);
+    face_result_t res;
+    face_get_result(&res, BOX_MAX_AGE_MS);
     overlay_fb_t fb = { .px = (uint16_t *)frame, .w = (int)s_w, .h = (int)s_h };
     const int pad = LABEL_SCALE * 2;
     const int th = overlay_text_height(LABEL_SCALE);
 
-    for (size_t i = 0; i < n; i++) {
-        const face_box_t *b = &boxes[i];
+    for (size_t i = 0; i < res.n; i++) {
+        const face_box_t *b = &res.box[i];
         uint16_t color = b->id >= 0 ? COLOR_KNOWN : COLOR_UNKNOWN;
         char label[24];
         if (b->id >= 0) {
@@ -216,62 +241,189 @@ static void requeue(int buf_index)
     ioctl(s_fd, VIDIOC_QBUF, &b);
 }
 
-/* Desenha as caixas e codifica o JPEG da web neste quadro, se alguém assiste e
- * já deu o intervalo de STREAM_MAX_FPS. */
-static void maybe_encode(uint8_t *frame, jpeg_encode_cfg_t *cfg, int64_t *last_encode_us)
+/* snprintf que acumula num buffer de cap bytes e nunca passa do fim; used
+ * >= cap depois = não coube. */
+#define APPEND(buf, cap, used, ...)                                                   \
+    do {                                                                              \
+        if ((used) < (cap)) {                                                         \
+            int _n = snprintf((buf) + (used), (cap) - (used), __VA_ARGS__);           \
+            (used) += _n > 0 ? (size_t)_n : 0;                                        \
+        }                                                                             \
+    } while (0)
+
+#define ALIGN_DOWN_16(v)    ((v) & ~15)
+#define ALIGN_UP_16(v)      ALIGN_DOWN_16((v) + 15)
+
+/* Região do quadro que vira o recorte de uma caixa. A saída tem w/step x
+ * h/step pixels: múltiplos de 16 (o encoder lê blocos de 16x8 em YUV422) e no
+ * máximo CROP_MAX_PX de lado. Arredondar cresce a região em volta do centro
+ * da caixa; na borda do quadro ela desliza para dentro. */
+typedef struct {
+    int x, y, w, h, step;
+} crop_t;
+
+static int clampi(int v, int lo, int hi)
+{
+    return v < lo ? lo : v > hi ? hi : v;
+}
+
+static crop_t crop_region(const face_box_t *b)
+{
+    int bw = b->x1 - b->x0 + 1, bh = b->y1 - b->y0 + 1;
+    int step = ((bw > bh ? bw : bh) + CROP_MAX_PX - 1) / CROP_MAX_PX;
+    int ow = ALIGN_UP_16((bw + step - 1) / step), oh = ALIGN_UP_16((bh + step - 1) / step);
+    if (ow > ALIGN_DOWN_16((int)s_w / step)) {
+        ow = ALIGN_DOWN_16((int)s_w / step);
+    }
+    if (oh > ALIGN_DOWN_16((int)s_h / step)) {
+        oh = ALIGN_DOWN_16((int)s_h / step);
+    }
+    crop_t c = { .w = ow * step, .h = oh * step, .step = step };
+    c.x = clampi(b->x0 - (c.w - bw) / 2, 0, (int)s_w - c.w);
+    c.y = clampi(b->y0 - (c.h - bh) / 2, 0, (int)s_h - c.h);
+    return c;
+}
+
+static void crop_copy(const uint8_t *frame, const crop_t *c, uint16_t *dst)
+{
+    const int ow = c->w / c->step, oh = c->h / c->step;
+    for (int r = 0; r < oh; r++) {
+        const uint16_t *row = (const uint16_t *)frame + (size_t)(c->y + r * c->step) * s_w + c->x;
+        if (c->step == 1) {
+            memcpy(dst, row, ow * sizeof(*dst));
+        } else {
+            for (int i = 0; i < ow; i++) {
+                dst[i] = row[i * c->step];
+            }
+        }
+        dst += ow;
+    }
+}
+
+/*
+ * Recorta cada rosto deste quadro, se alguém assiste e já deu o intervalo de
+ * CROP_MAX_FPS. Só para quadros que a IA acabou de analisar: as caixas
+ * publicadas são as deles, então o recorte cai exatamente no rosto.
+ *
+ * Cada evento leva a região recortada (x,y,w,h, em pixels do quadro) e o
+ * centro da caixa naquele quadro (cx,cy): a página desenha o recorte na
+ * caixa mais recente deslocando-o do quanto a caixa andou desde então.
+ */
+static void maybe_send_crops(const uint8_t *frame, int64_t *last_us)
 {
     int64_t now = esp_timer_get_time();
-    if (atomic_load(&s_consumers) <= 0 || now - *last_encode_us < 1000000 / STREAM_MAX_FPS) {
+    if (atomic_load(&s_viewers) <= 0 || now - *last_us < 1000000 / CROP_MAX_FPS) {
         return;
     }
-    *last_encode_us = now;
+    face_result_t res;
+    face_get_result(&res, BOX_MAX_AGE_MS);
+    if (res.n == 0) {
+        return;
+    }
+    *last_us = now;
+
+    jpeg_encode_cfg_t cfg = {
+        .src_type = JPEG_ENCODE_IN_FORMAT_RGB565,
+        .sub_sample = JPEG_DOWN_SAMPLING_YUV422,
+        .image_quality = atomic_load(&s_quality),
+    };
+    size_t used = 0;
+    for (size_t i = 0; i < res.n; i++) {
+        const face_box_t *b = &res.box[i];
+        crop_t c = crop_region(b);
+        cfg.width = c.w / c.step;
+        cfg.height = c.h / c.step;
+        crop_copy(frame, &c, s_crop_rgb);
+        uint32_t len = 0;
+        if (jpeg_encoder_process(s_jpeg, &cfg, (const uint8_t *)s_crop_rgb, cfg.width * cfg.height * 2,
+                                 s_crop_jpg, s_crop_jpg_cap, &len) != ESP_OK) {
+            s_stats.encode_failed++;
+            continue;
+        }
+
+        size_t start = used, b64 = 0;
+        APPEND(s_crops_work, s_crops_cap, used,
+               "event: crop\ndata: {\"trk\":%" PRIu32 ",\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,"
+               "\"cx\":%d,\"cy\":%d,\"jpg\":\"",
+               b->track, c.x, c.y, c.w, c.h, (b->x0 + b->x1) / 2, (b->y0 + b->y1) / 2);
+        if (used >= s_crops_cap ||
+            mbedtls_base64_encode((unsigned char *)s_crops_work + used, s_crops_cap - used, &b64, s_crop_jpg, len) != 0) {
+            used = start;
+            break;
+        }
+        used += b64;
+        APPEND(s_crops_work, s_crops_cap, used, "\"}\n\n");
+        if (used >= s_crops_cap) {
+            used = start;
+            break;
+        }
+    }
+    s_stats.crop_us = (uint32_t)(esp_timer_get_time() - now);
+    if (used == 0) {
+        return;
+    }
+
+    xSemaphoreTake(s_crops_lock, portMAX_DELAY);
+    char *done = s_crops_work;
+    s_crops_work = s_crops_latest;
+    s_crops_latest = done;
+    s_crops_len = used;
+    s_crops_seq++;
+    xSemaphoreGive(s_crops_lock);
+    s_stats.crop_sets++;
+    s_stats.crop_bytes = used;
+}
+
+/* Foto do quadro inteiro, com as caixas desenhadas, se alguém pediu. Depois
+ * dos recortes: desenhar as caixas altera o quadro. */
+static void maybe_encode_photo(uint8_t *frame, jpeg_encode_cfg_t *cfg)
+{
+    if (atomic_load(&s_photo_waiters) <= 0) {
+        return;
+    }
     draw_faces(frame);
 
     cfg->image_quality = atomic_load(&s_quality);
     uint32_t len = 0;
-    int64_t t0 = esp_timer_get_time();
-    esp_err_t err = jpeg_encoder_process(s_jpeg, cfg, frame, s_frame_len, s_work, s_jpeg_cap, &len);
-    s_stats.encode_us = (uint32_t)(esp_timer_get_time() - t0);
-
-    if (err == ESP_OK) {
-        xSemaphoreTake(s_lock, portMAX_DELAY);
-        uint8_t *done = s_work;
-        s_work = s_latest;
-        s_latest = done;
-        s_latest_len = len;
-        s_latest_seq++;
-        xSemaphoreGive(s_lock);
-        s_stats.encoded++;
-        s_stats.jpeg_bytes = len;
-    } else {
+    if (jpeg_encoder_process(s_jpeg, cfg, frame, s_frame_len, s_work, s_jpeg_cap, &len) != ESP_OK) {
         s_stats.encode_failed++;
+        return;
     }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    uint8_t *done = s_work;
+    s_work = s_latest;
+    s_latest = done;
+    s_latest_len = len;
+    s_latest_seq++;
+    xSemaphoreGive(s_lock);
+    s_stats.photos++;
 }
 
 /*
  * Prioridade é a IA: cada quadro novo vai primeiro para ela, sem cópia. Se ela
  * aceita, o buffer só volta (por s_released) quando ela termina - e aí, se for
- * a vez da web, recebe as caixas e vira JPEG antes de voltar para a câmera.
- * Quadros que a IA recusou (ocupada) também podem ir para a web.
+ * a vez da web, as caixas dele são recortadas antes de voltar para a câmera.
+ * Quadros que a IA recusou (ocupada) só servem para a foto.
  */
 static void capture_task(void *arg)
 {
     const int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     /* YUV422 funciona com qualquer altura múltipla de 8 (720, 960 e 1080). */
-    jpeg_encode_cfg_t cfg = {
+    jpeg_encode_cfg_t photo_cfg = {
         .width = s_w,
         .height = s_h,
         .src_type = JPEG_ENCODE_IN_FORMAT_RGB565,
         .sub_sample = JPEG_DOWN_SAMPLING_YUV422,
     };
-    int64_t last_encode_us = 0;
+    int64_t last_crop_us = 0;
 
     while (1) {
         int v;
         while (xQueueReceive(s_released, &v, 0) == pdTRUE) {
             int idx = v & ~RELEASED_STALE;
             if (!(v & RELEASED_STALE)) {
-                maybe_encode(s_buf[idx], &cfg, &last_encode_us);
+                maybe_send_crops(s_buf[idx], &last_crop_us);
+                maybe_encode_photo(s_buf[idx], &photo_cfg);
             }
             requeue(idx);
         }
@@ -286,14 +438,14 @@ static void capture_task(void *arg)
         if (face_offer_frame(s_buf[buf.index], buf.index)) {
             continue;   /* está com a IA; volta por s_released */
         }
-        maybe_encode(s_buf[buf.index], &cfg, &last_encode_us);
+        maybe_encode_photo(s_buf[buf.index], &photo_cfg);
         ioctl(s_fd, VIDIOC_QBUF, &buf);
     }
     vTaskDelete(NULL);
 }
 
-/* Espera um quadro mais novo que *seq e copia para dst (capacidade s_jpeg_cap). */
-static esp_err_t grab_frame(uint8_t *dst, size_t *len, uint32_t *seq)
+/* Espera uma foto mais nova que *seq e copia para dst (capacidade s_jpeg_cap). */
+static esp_err_t grab_photo(uint8_t *dst, size_t *len, uint32_t *seq)
 {
     int64_t deadline = esp_timer_get_time() + FRAME_WAIT_US;
     while (s_latest_seq == *seq) {
@@ -312,68 +464,14 @@ static esp_err_t grab_frame(uint8_t *dst, size_t *len, uint32_t *seq)
 
 /* ---- HTTP ------------------------------------------------------------------ */
 
-static const char INDEX_HTML[] =
-    "<!doctype html><html lang=pt-br><meta charset=utf-8>"
-    "<meta name=viewport content=\"width=device-width,initial-scale=1\">"
-    "<title>IMX708 rostos</title>"
-    "<style>"
-    "body{margin:0;background:#111;color:#ddd;font:14px system-ui,sans-serif}"
-    "main{max-width:1280px;margin:auto;padding:12px}"
-    "img{display:block;width:100%;height:auto;aspect-ratio:auto 16/9;background:#000}"
-    ".bar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:10px 0}"
-    "button{font:inherit;padding:6px 12px;border:0;border-radius:4px;background:#2a6;color:#fff;cursor:pointer}"
-    "button.del{background:#a33}input[type=number]{width:5em;font:inherit}"
-    "a{color:#6cf}#st,#ai{font-family:monospace;color:#9b9}#msg{font-weight:bold}"
-    "</style><main>"
-    "<img id=v src=\"/stream\" alt=\"vídeo da câmera\">"
-    "<div class=bar>"
-    "<button id=en>Cadastrar rosto</button><span id=msg></span>"
-    "</div><div class=bar>"
-    "<label>apagar ID <input id=did type=number min=1></label>"
-    "<button class=del id=del>Apagar</button>"
-    "<button class=del id=clr>Apagar todos</button>"
-    "<span>cadastrados: <b id=ids>-</b></span>"
-    "</div><div class=bar>"
-    "<label>qualidade JPEG <input id=q type=range min=10 max=95 step=5> <b id=qv></b></label>"
-    "<a href=\"/capture.jpg\" download=\"rosto.jpg\">salvar foto</a>"
-    "<a href=\"/status\">status</a>"
-    "</div><div id=ai></div><div id=st>conectando...</div></main>"
-    "<script>"
-    "const $=id=>document.getElementById(id),v=$('v'),q=$('q'),msg=$('msg');"
-    "let last=null;"
-    "v.onerror=()=>setTimeout(()=>v.src='/stream?'+Date.now(),1000);"
-    "q.oninput=()=>$('qv').textContent=q.value;"
-    "q.onchange=()=>fetch('/quality?q='+q.value);"
-    "async function post(url){const r=await fetch(url,{method:'POST'});return r.json();}"
-    "$('en').onclick=async()=>{msg.textContent='olhe para a câmera...';"
-    "try{const j=await post('/enroll');"
-    "msg.textContent=j.ok?(j.new?'Cadastrado: ID '+j.id:'Já cadastrado: ID '+j.id+' ('+j.sim+'%)'):j.error;}"
-    "catch(e){msg.textContent='sem resposta da placa';}};"
-    "$('del').onclick=async()=>{const id=$('did').value;if(!id)return;"
-    "const j=await post('/delete?id='+id);msg.textContent=j.ok?'ID '+id+' apagado':j.error;};"
-    "$('clr').onclick=async()=>{if(!confirm('Apagar todos os cadastros?'))return;"
-    "const j=await post('/delete?id=all');msg.textContent=j.ok?'todos apagados':j.error;};"
-    "function faces(f){return f.length?f.map(x=>x.id>=0?'ID '+x.id+' ('+x.sim+'%)':'desconhecido').join(', '):'nenhum rosto';}"
-    "async function poll(){"
-    "try{const s=await(await fetch('/status')).json();"
-    "$('ids').textContent=s.enrolled.length?s.enrolled.join(', '):'nenhum';"
-    "if(!last){q.value=s.quality;$('qv').textContent=s.quality;}"
-    "else{const dt=(s.uptime_ms-last.uptime_ms)/1000;"
-    "$('ai').textContent='na imagem: '+faces(s.faces)+' · IA '+((s.ai_cycles-last.ai_cycles)/dt).toFixed(1)+' fps'"
-    "+' (detecção '+(s.detect_us/1000).toFixed(0)+' ms, reconhecimento '+(s.recog_us/1000).toFixed(0)+' ms)';"
-    "$('st').textContent=s.width+'x'+s.height+' · '+((s.encoded-last.encoded)/dt).toFixed(1)+' fps'"
-    "+' · '+(s.jpeg_bytes/1024).toFixed(0)+' KB/quadro'"
-    "+' · '+((s.bytes_sent-last.bytes_sent)*8/dt/1e6).toFixed(2)+' Mbit/s'"
-    "+' · '+s.viewers+' assistindo';}"
-    "last=s;}catch(e){$('st').textContent='sem resposta da placa';last=null;}"
-    "setTimeout(poll,1000);}"
-    "poll();"
-    "</script>";
+/* main/index.html, embutido pelo CMakeLists (EMBED_TXTFILES, que põe um \0 no fim). */
+extern const char index_html_start[] asm("_binary_index_html_start");
+extern const char index_html_end[] asm("_binary_index_html_end");
 
 static esp_err_t index_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
-    return httpd_resp_send(req, INDEX_HTML, sizeof(INDEX_HTML) - 1);
+    return httpd_resp_send(req, index_html_start, index_html_end - index_html_start - 1);
 }
 
 /* O navegador sempre pede; 204 evita um warning 404 no log a cada visita. */
@@ -393,66 +491,169 @@ static esp_err_t send_json(httpd_req_t *req, const char *status, const char *bod
     return httpd_resp_sendstr(req, body);
 }
 
-static void stream_task(void *arg)
+/* [{"trk","id","sim","x","y","dx","dy","age"}, ...]: x,y,dx,dy como no
+ * terminal (face.h); age = ms desde que o rosto apareceu. */
+static size_t faces_json(char *buf, size_t cap, size_t used, const face_result_t *r)
+{
+    APPEND(buf, cap, used, "[");
+    for (size_t i = 0; i < r->n; i++) {
+        const face_box_t *b = &r->box[i];
+        APPEND(buf, cap, used,
+               "%s{\"trk\":%" PRIu32 ",\"id\":%d,\"sim\":%u,\"x\":%d,\"y\":%d,\"dx\":%d,\"dy\":%d,\"age\":%" PRId64 "}",
+               i ? "," : "", b->track, b->id, b->sim_pct, (b->x0 + b->x1) / 2, (b->y0 + b->y1) / 2,
+               b->x1 - b->x0, b->y1 - b->y0, (r->frame_us - b->since_us) / 1000);
+    }
+    APPEND(buf, cap, used, "]");
+    return used;
+}
+
+/* O JSON do /status (sem \n no fim: também vai numa linha "data:" do SSE). */
+static size_t status_json(char *buf, size_t cap, size_t used)
+{
+    face_stats_t ai;
+    face_get_stats(&ai);
+    face_result_t res;
+    face_get_result(&res, BOX_MAX_AGE_MS);
+
+    APPEND(buf, cap, used,
+           "{\"width\":%" PRIu32 ",\"height\":%" PRIu32 ",\"quality\":%d,\"viewers\":%d,\"uptime_ms\":%" PRId64 ","
+           "\"captured\":%" PRIu32 ",\"crop_sets\":%" PRIu32 ",\"crop_bytes\":%" PRIu32 ",\"crop_us\":%" PRIu32 ","
+           "\"photos\":%" PRIu32 ",\"encode_failed\":%" PRIu32 ",\"bytes_sent\":%" PRIu64 ","
+           "\"ai_cycles\":%" PRIu32 ",\"detect_us\":%" PRIu32 ",\"latency_us\":%" PRIu32 ","
+           "\"recogs\":%" PRIu32 ",\"recog_us\":%" PRIu32 ","
+           "\"heap_internal\":%u,\"heap_psram\":%u,\"t\":%" PRId64 ",\"faces\":",
+           s_w, s_h, atomic_load(&s_quality), atomic_load(&s_viewers), esp_timer_get_time() / 1000,
+           s_stats.captured, s_stats.crop_sets, s_stats.crop_bytes, s_stats.crop_us,
+           s_stats.photos, s_stats.encode_failed, s_stats.bytes_sent,
+           ai.cycles, ai.detect_us, ai.latency_us, ai.recogs, ai.recog_us,
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), res.frame_us / 1000);
+    used = faces_json(buf, cap, used, &res);
+
+    int ids[64];
+    size_t total = face_list(ids, sizeof(ids) / sizeof(ids[0]));
+    APPEND(buf, cap, used, ",\"enrolled_total\":%u,\"enrolled\":[", (unsigned)total);
+    for (size_t i = 0; i < total && i < sizeof(ids) / sizeof(ids[0]); i++) {
+        APPEND(buf, cap, used, "%s%d", i ? "," : "", ids[i]);
+    }
+    APPEND(buf, cap, used, "]}");
+    return used;
+}
+
+/* Bytes crus no socket (sem chunked): cada evento sai num send() só - com
+ * TCP_NODELAY, um segmento por evento em vez dos três do chunked. */
+static bool send_all(httpd_req_t *req, const char *buf, size_t len)
+{
+    while (len > 0) {
+        int n = httpd_send(req, buf, len);
+        if (n <= 0) {
+            return false;
+        }
+        buf += n;
+        len -= n;
+        s_stats.bytes_sent += n;
+    }
+    return true;
+}
+
+/* Sem Content-Length e sem chunked: o corpo termina quando a conexão fecha. */
+static const char SSE_HEADERS[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/event-stream\r\n"
+    "Cache-Control: no-store\r\n"
+    "Access-Control-Allow-Origin: *\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "retry: 1000\n\n";
+
+/*
+ * Um espectador do /events. Olha a cada EVENTS_POLL_MS se há:
+ *   - resultado novo da IA com rosto (ou o primeiro sem rosto depois de ter
+ *     tido): evento "faces" - a caixa de cada rosto, a cada quadro analisado;
+ *   - conjunto novo de recortes: os eventos "crop" já prontos;
+ *   - 1 s desde o último "stats".
+ * Se o link for mais lento que a IA, só o mais recente de cada um sai.
+ */
+static void events_task(void *arg)
 {
     httpd_req_t *req = arg;
-    uint8_t *frame = heap_caps_malloc(s_jpeg_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    uint32_t frames = 0;
-    uint64_t bytes = 0;
+    char *text = heap_caps_malloc(EVENT_TEXT_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    char *crops = heap_caps_malloc(s_crops_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint32_t events = 0;
     int64_t t_start = esp_timer_get_time();
 
-    if (!frame) {
+    if (!text || !crops) {
         ESP_LOGE(TAG, "sem PSRAM para o espectador");
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sem memoria");
         goto done;
     }
 
-    /* Sem isto, o Nagle segura o final de cada quadro até o ACK do anterior,
-     * que o navegador atrasa (delayed ACK): a taxa despenca sem motivo. */
+    /* Sem isto, o Nagle segura cada evento até o ACK do anterior, que o
+     * navegador atrasa (delayed ACK): as caixas chegariam aos trancos. */
     int one = 1;
     setsockopt(httpd_req_to_sockfd(req), IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-    httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=" PART_BOUNDARY);
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-
-    atomic_fetch_add(&s_consumers, 1);
     ESP_LOGI(TAG, "espectador entrou (%d assistindo)", atomic_load(&s_viewers));
 
-    uint32_t seq = s_latest_seq;
-    size_t len;
-    while (grab_frame(frame, &len, &seq) == ESP_OK) {
-        char part[128];
-        int n = snprintf(part, sizeof(part),
-                         "\r\n--" PART_BOUNDARY "\r\nContent-Type: image/jpeg\r\n"
-                         "Content-Length: %u\r\n\r\n", (unsigned)len);
-        if (httpd_resp_send_chunk(req, part, n) != ESP_OK ||
-            httpd_resp_send_chunk(req, (const char *)frame, len) != ESP_OK) {
-            break;
+    uint32_t face_seq = 0, crop_seq = s_crops_seq;
+    bool had_faces = true;      /* o primeiro "faces" sai mesmo sem rosto */
+    int64_t next_stats = 0;
+    bool ok = send_all(req, SSE_HEADERS, sizeof(SSE_HEADERS) - 1);
+
+    while (ok) {
+        face_result_t res;
+        face_get_result(&res, BOX_MAX_AGE_MS);
+        if (res.n > 0 ? res.seq != face_seq : had_faces) {
+            face_seq = res.seq;
+            had_faces = res.n > 0;
+            size_t used = 0;
+            APPEND(text, EVENT_TEXT_CAP, used, "event: faces\ndata: {\"seq\":%" PRIu32 ",\"t\":%" PRId64 ",\"f\":",
+                   res.seq, res.frame_us / 1000);
+            used = faces_json(text, EVENT_TEXT_CAP, used, &res);
+            APPEND(text, EVENT_TEXT_CAP, used, "}\n\n");
+            if (used < EVENT_TEXT_CAP) {
+                ok = send_all(req, text, used);
+                events++;
+            }
         }
-        frames++;
-        bytes += len;
-        s_stats.sent++;
-        s_stats.bytes_sent += len;
+
+        if (ok && s_crops_seq != crop_seq) {
+            xSemaphoreTake(s_crops_lock, portMAX_DELAY);
+            size_t len = s_crops_len;
+            memcpy(crops, s_crops_latest, len);
+            crop_seq = s_crops_seq;
+            xSemaphoreGive(s_crops_lock);
+            ok = send_all(req, crops, len);
+        }
+
+        int64_t now = esp_timer_get_time();
+        if (ok && now >= next_stats) {
+            next_stats = now + STATS_PERIOD_US;
+            size_t used = 0;
+            APPEND(text, EVENT_TEXT_CAP, used, "event: stats\ndata: ");
+            used = status_json(text, EVENT_TEXT_CAP, used);
+            APPEND(text, EVENT_TEXT_CAP, used, "\n\n");
+            if (used < EVENT_TEXT_CAP) {
+                ok = send_all(req, text, used);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(EVENTS_POLL_MS));
     }
-    atomic_fetch_sub(&s_consumers, 1);
 
     uint32_t ms = (uint32_t)((esp_timer_get_time() - t_start) / 1000);
-    ESP_LOGI(TAG, "espectador saiu: %" PRIu32 " quadros em %" PRIu32 " ms (%" PRIu32 ".%" PRIu32
-                  " fps, %" PRIu32 " kbit/s)",
-             frames, ms, ms ? frames * 1000 / ms : 0, ms ? (frames * 10000 / ms) % 10 : 0,
-             ms ? (uint32_t)(bytes * 8 / ms) : 0);
+    ESP_LOGI(TAG, "espectador saiu depois de %" PRIu32 " s (%" PRIu32 " eventos de caixas)", ms / 1000, events);
 
 done:
-    free(frame);
+    free(text);
+    free(crops);
     httpd_req_async_handler_complete(req);
     atomic_fetch_sub(&s_viewers, 1);
     vTaskDelete(NULL);
 }
 
 /*
- * O httpd atende uma requisição por vez numa única task, e um stream nunca
- * termina. Por isso cada stream vai para uma task própria (handler
+ * O httpd atende uma requisição por vez numa única task, e o /events nunca
+ * termina. Por isso cada espectador vai para uma task própria (handler
  * assíncrono) e o servidor continua livre para página, foto e status.
  */
 static esp_err_t camera_down(httpd_req_t *req)
@@ -461,7 +662,7 @@ static esp_err_t camera_down(httpd_req_t *req)
     return httpd_resp_sendstr(req, "a camera nao iniciou - veja o log serial");
 }
 
-static esp_err_t stream_handler(httpd_req_t *req)
+static esp_err_t events_handler(httpd_req_t *req)
 {
     if (!s_camera_ok) {
         return camera_down(req);
@@ -477,7 +678,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
         atomic_fetch_sub(&s_viewers, 1);
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "async falhou");
     }
-    if (xTaskCreate(stream_task, "stream", STREAM_TASK_STACK, copy, 5, NULL) != pdPASS) {
+    if (xTaskCreate(events_task, "events", EVENTS_TASK_STACK, copy, 5, NULL) != pdPASS) {
         httpd_req_async_handler_complete(copy);
         atomic_fetch_sub(&s_viewers, 1);
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sem memoria para a task");
@@ -495,13 +696,12 @@ static esp_err_t capture_handler(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sem memoria");
     }
 
-    /* Espera um quadro codificado depois desta requisição: sem stream aberto o
-     * último JPEG pode ser velho. */
-    atomic_fetch_add(&s_consumers, 1);
+    /* Espera uma foto tirada depois desta requisição: a anterior pode ser velha. */
+    atomic_fetch_add(&s_photo_waiters, 1);
     uint32_t seq = s_latest_seq;
     size_t len = 0;
-    esp_err_t err = grab_frame(frame, &len, &seq);
-    atomic_fetch_sub(&s_consumers, 1);
+    esp_err_t err = grab_photo(frame, &len, &seq);
+    atomic_fetch_sub(&s_photo_waiters, 1);
 
     if (err != ESP_OK) {
         free(frame);
@@ -514,52 +714,11 @@ static esp_err_t capture_handler(httpd_req_t *req)
     return err;
 }
 
-/* snprintf que acumula num buffer e nunca passa do fim. */
-#define APPEND(buf, used, ...)                                                        \
-    do {                                                                              \
-        if ((used) < sizeof(buf)) {                                                   \
-            int _n = snprintf((buf) + (used), sizeof(buf) - (used), __VA_ARGS__);     \
-            (used) += _n > 0 ? (size_t)_n : 0;                                        \
-        }                                                                             \
-    } while (0)
-
 static esp_err_t status_handler(httpd_req_t *req)
 {
-    char body[1024];
-    size_t used = 0;
-    face_stats_t ai;
-    face_get_stats(&ai);
-
-    APPEND(body, used,
-           "{\"width\":%" PRIu32 ",\"height\":%" PRIu32 ",\"quality\":%d,\"viewers\":%d,"
-           "\"captured\":%" PRIu32 ",\"encoded\":%" PRIu32 ",\"encode_failed\":%" PRIu32 ","
-           "\"encode_us\":%" PRIu32 ",\"jpeg_bytes\":%" PRIu32 ",\"sent\":%" PRIu32 ","
-           "\"bytes_sent\":%" PRIu64 ",\"uptime_ms\":%" PRId64 ","
-           "\"ai_cycles\":%" PRIu32 ",\"detect_us\":%" PRIu32 ",\"recog_us\":%" PRIu32 ","
-           "\"heap_internal\":%u,\"heap_psram\":%u,\"faces\":[",
-           s_w, s_h, atomic_load(&s_quality), atomic_load(&s_viewers),
-           s_stats.captured, s_stats.encoded, s_stats.encode_failed,
-           s_stats.encode_us, s_stats.jpeg_bytes, s_stats.sent,
-           s_stats.bytes_sent, esp_timer_get_time() / 1000,
-           ai.cycles, ai.detect_us, ai.recog_us,
-           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-
-    face_box_t boxes[FACE_MAX_BOXES];
-    size_t n = face_get_boxes(boxes, FACE_MAX_BOXES, BOX_MAX_AGE_MS);
-    for (size_t i = 0; i < n; i++) {
-        APPEND(body, used, "%s{\"id\":%d,\"sim\":%u,\"box\":[%d,%d,%d,%d]}", i ? "," : "",
-               boxes[i].id, boxes[i].sim_pct, boxes[i].x0, boxes[i].y0, boxes[i].x1, boxes[i].y1);
-    }
-
-    int ids[64];
-    size_t total = face_list(ids, sizeof(ids) / sizeof(ids[0]));
-    APPEND(body, used, "],\"enrolled_total\":%u,\"enrolled\":[", (unsigned)total);
-    for (size_t i = 0; i < total && i < sizeof(ids) / sizeof(ids[0]); i++) {
-        APPEND(body, used, "%s%d", i ? "," : "", ids[i]);
-    }
-    APPEND(body, used, "]}\n");
-
+    char body[1536];
+    size_t used = status_json(body, sizeof(body), 0);
+    APPEND(body, sizeof(body), used, "\n");
     if (used >= sizeof(body)) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "status grande demais");
     }
@@ -633,7 +792,7 @@ static bool start_server(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 6144;
-    /* Os streams seguram seus sockets; sobram 3 para página, foto e status. */
+    /* Os /events seguram seus sockets; sobram 3 para página, foto e status. */
     cfg.max_open_sockets = MAX_VIEWERS + 3;
     cfg.max_uri_handlers = 10;
     cfg.lru_purge_enable = true;
@@ -646,7 +805,7 @@ static bool start_server(void)
 
     static const httpd_uri_t uris[] = {
         { .uri = "/",            .method = HTTP_GET,  .handler = index_handler },
-        { .uri = "/stream",      .method = HTTP_GET,  .handler = stream_handler },
+        { .uri = "/events",      .method = HTTP_GET,  .handler = events_handler },
         { .uri = "/capture.jpg", .method = HTTP_GET,  .handler = capture_handler },
         { .uri = "/status",      .method = HTTP_GET,  .handler = status_handler },
         { .uri = "/quality",     .method = HTTP_GET,  .handler = quality_handler },
@@ -776,13 +935,24 @@ static esp_err_t camera_start(void)
         ESP_LOGE(TAG, "encoder JPEG de hardware indisponível");
         return ESP_FAIL;
     }
-    /* Metade do quadro RGB565 - um JPEG mesmo a q95 fica bem abaixo. */
-    jpeg_encode_memory_alloc_cfg_t mem = { .buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER };
-    size_t cap_a = 0, cap_b = 0;
-    s_work = jpeg_alloc_encoder_mem((size_t)s_w * s_h, &mem, &cap_a);
-    s_latest = jpeg_alloc_encoder_mem((size_t)s_w * s_h, &mem, &cap_b);
+    /* Saída com metade do tamanho em RGB565 - um JPEG mesmo a q95 fica bem
+     * abaixo. Vale para a foto e para o recorte. */
+    jpeg_encode_memory_alloc_cfg_t out = { .buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER };
+    jpeg_encode_memory_alloc_cfg_t in = { .buffer_direction = JPEG_ENC_ALLOC_INPUT_BUFFER };
+    size_t cap_a = 0, cap_b = 0, cap_rgb = 0;
+    s_work = jpeg_alloc_encoder_mem((size_t)s_w * s_h, &out, &cap_a);
+    s_latest = jpeg_alloc_encoder_mem((size_t)s_w * s_h, &out, &cap_b);
     s_lock = xSemaphoreCreateMutex();
-    if (!s_work || !s_latest || !s_lock) {
+    s_crop_rgb = jpeg_alloc_encoder_mem(CROP_MAX_PX * CROP_MAX_PX * 2, &in, &cap_rgb);
+    s_crop_jpg = jpeg_alloc_encoder_mem(CROP_MAX_PX * CROP_MAX_PX, &out, &s_crop_jpg_cap);
+    /* Por rosto: o JPEG em base64 (4 a cada 3 bytes, mais o \0 do mbedtls)
+     * e o resto do evento. */
+    s_crops_cap = FACE_MAX_BOXES * (4 * ((s_crop_jpg_cap + 2) / 3) + 1 + 160);
+    s_crops_work = heap_caps_malloc(s_crops_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_crops_latest = heap_caps_malloc(s_crops_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_crops_lock = xSemaphoreCreateMutex();
+    if (!s_work || !s_latest || !s_lock || !s_crop_rgb || !s_crop_jpg || !s_crops_work || !s_crops_latest ||
+        !s_crops_lock) {
         ESP_LOGE(TAG, "sem PSRAM para os buffers JPEG");
         return ESP_ERR_NO_MEM;
     }
@@ -792,8 +962,8 @@ static esp_err_t camera_start(void)
         ESP_LOGE(TAG, "VIDIOC_STREAMON falhou");
         return ESP_FAIL;
     }
-    /* Core 0: o core 1 é da IA. Prioridade acima dos streams, para o sensor
-     * nunca ficar sem buffer por causa de um envio. */
+    /* Core 0: o core 1 é da IA. Prioridade acima dos espectadores, para o
+     * sensor nunca ficar sem buffer por causa de um envio. */
     s_released = xQueueCreate(BUFFER_COUNT, sizeof(int));
     if (!s_released) {
         ESP_LOGE(TAG, "sem memória para a fila de buffers");
@@ -808,7 +978,7 @@ static esp_err_t camera_start(void)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "IMX708 + reconhecimento facial -> MJPEG via Wi-Fi");
+    ESP_LOGI(TAG, "IMX708 + reconhecimento facial -> caixas e recortes via Wi-Fi");
 
     /* Sem câmera, segue mesmo assim: Wi-Fi e página sobem (o vídeo responde
      * 503), o que já testa o link do C6 e deixa /status acessível. */
@@ -833,5 +1003,5 @@ void app_main(void)
     }
 
     ESP_LOGI(TAG, "==== abra no navegador: http://%s/ ====", ip);
-    ESP_LOGI(TAG, "  stream direto: http://%s/stream   foto: http://%s/capture.jpg", ip, ip);
+    ESP_LOGI(TAG, "  eventos: http://%s/events   foto inteira: http://%s/capture.jpg", ip, ip);
 }

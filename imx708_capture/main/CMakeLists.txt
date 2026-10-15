@@ -1,8 +1,9 @@
 idf_component_register(
     SRCS "imx708_capture_main.c" "face.cpp" "overlay.c" "wifi.c"
     INCLUDE_DIRS "."
+    EMBED_TXTFILES "index.html"
     REQUIRES esp_video esp_cam_sensor_imx esp_driver_jpeg esp_driver_i2c esp_http_server esp_timer
-             esp_wifi esp_netif esp_event nvs_flash lwip fatfs human_face_recognition
+             esp_wifi esp_netif esp_event nvs_flash lwip fatfs mbedtls human_face_recognition
 )
 
 # Fail the build if an ISP tuning config did not resolve. esp_ipa's own

@@ -1,0 +1,3 @@
+# Rockchip (VID 2207): ADB da Luckfox rodando e modo MaskRom de gravação.
+# Instalar: sudo cp udev/51-rockchip.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules && sudo udevadm trigger
+SUBSYSTEM=="usb", ATTR{idVendor}=="2207", MODE="0660", GROUP="plugdev"

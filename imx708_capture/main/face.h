@@ -2,8 +2,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Detecção + reconhecimento facial (modelos do esp-dl) numa task própria, no
- * core 1, no ritmo que der. O vídeo não espera por ela: a captura oferece um
- * quadro quando a IA está livre e desenha o último resultado em cada quadro.
+ * core 1, no ritmo que der. A captura não espera por ela: oferece um quadro
+ * quando a IA está livre e usa sempre o último resultado publicado.
  *
  * Cadastros: um vetor de características por pessoa, com ID estável, em
  * /spiflash/faces.bin (FAT na partição "storage"). Sobrevive a reboot e a
@@ -22,11 +22,23 @@ extern "C" {
 
 #define FACE_MAX_BOXES 4
 
+/* Um rosto. Terminal e web mostram o mesmo [ID, X, Y, dX, dY]:
+ * X,Y = centro ((x0+x1)/2, (y0+y1)/2), dX,dY = tamanho (x1-x0, y1-y0). */
 typedef struct {
     int16_t x0, y0, x1, y1;   /* em pixels do quadro da câmera */
     int16_t id;               /* -1 = desconhecido */
     uint8_t sim_pct;          /* semelhança com o cadastro, 0-100 */
+    uint32_t track;           /* o mesmo enquanto este rosto é seguido */
+    int64_t since_us;         /* quando ele apareceu (esp_timer) */
 } face_box_t;
+
+/* O que a IA achou num quadro. */
+typedef struct {
+    uint32_t seq;             /* muda a cada quadro analisado */
+    int64_t frame_us;         /* captura do quadro analisado (esp_timer) */
+    size_t n;
+    face_box_t box[FACE_MAX_BOXES];
+} face_result_t;
 
 typedef enum {
     FACE_ENROLL_NEW,          /* cadastrado com ID novo */
@@ -45,8 +57,10 @@ typedef struct {
 
 typedef struct {
     uint32_t cycles;          /* quadros analisados */
-    uint32_t detect_us;       /* último ciclo: detecção */
-    uint32_t recog_us;        /* último ciclo: reconhecimento de todos os rostos */
+    uint32_t detect_us;       /* último quadro: detecção */
+    uint32_t latency_us;      /* último quadro: da captura ao resultado publicado */
+    uint32_t recogs;          /* reconhecimentos feitos */
+    uint32_t recog_us;        /* último reconhecimento (um rosto) */
 } face_stats_t;
 
 /* Devolve à captura um buffer que a IA terminou de usar (chamada nas tasks da
@@ -63,8 +77,8 @@ esp_err_t face_init(int width, int height, face_release_fn release);
  * ocupada devolve false e o buffer continua com quem chamou. */
 bool face_offer_frame(uint8_t *rgb565, int buf_index);
 
-/* Último resultado, se tiver no máximo max_age_ms. Devolve quantas caixas. */
-size_t face_get_boxes(face_box_t *out, size_t max, uint32_t max_age_ms);
+/* Último resultado publicado; sem caixas (n = 0) se tiver mais que max_age_ms. */
+void face_get_result(face_result_t *out, uint32_t max_age_ms);
 
 /* Cadastra o maior rosto do próximo quadro com rosto. Bloqueia até timeout_ms. */
 face_enroll_result_t face_enroll(uint32_t timeout_ms);

@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="pt-br">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rostos ao vivo</title>
+<style>
+:root{--bg:#0e1116;--panel:#161b22;--line:#2a313c;--text:#e6e9ee;--dim:#8b95a3;
+  --known:#3ddc84;--unknown:#ff9f1a;--bad:#ff5c5c;--accent:#4aa3ff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line)}
+header h1{font-size:16px;margin:0;font-weight:600}
+#live{font-size:12px;padding:2px 10px;border-radius:999px;background:#3a1d1d;color:var(--bad)}
+#live.on{background:#173524;color:var(--known)}
+#res{margin-left:auto;color:var(--dim);font-variant-numeric:tabular-nums}
+main{display:grid;grid-template-columns:minmax(0,1fr) 470px;gap:16px;max-width:1500px;margin:auto;padding:16px}
+@media (max-width:980px){main{grid-template-columns:minmax(0,1fr)}}
+#cv{display:block;width:100%;height:auto;max-height:82vh;object-fit:contain;background:#000;border-radius:6px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:12px;margin-bottom:12px}
+h2{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 8px}
+table{width:100%;border-collapse:collapse;font:13px ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}
+th{font:600 11px system-ui,sans-serif;color:var(--dim);text-align:right;padding:4px;border-bottom:1px solid var(--line)}
+td{text-align:right;padding:5px 4px;border-bottom:1px solid #1f252e}
+th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}
+tr.k td:first-child{color:var(--known);font-weight:700}
+tr.u td:first-child{color:var(--unknown);font-weight:700}
+td.none{text-align:center;color:var(--dim);font-family:system-ui,sans-serif;padding:14px}
+.cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.card{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px 10px}
+.card span{display:block;font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
+.card b{display:block;font-size:20px;font-variant-numeric:tabular-nums}
+.card small{color:var(--dim);font-variant-numeric:tabular-nums}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+button{font:inherit;padding:6px 12px;border:0;border-radius:4px;background:#238a4f;color:#fff;cursor:pointer}
+button.del{background:#8f2d2d}
+input[type=number]{width:5em;font:inherit;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:4px}
+a{color:var(--accent)}
+#msg{font-weight:600}
+#foot{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums}
+</style>
+
+<header>
+  <h1>Rostos ao vivo</h1>
+  <span id="live">conectando…</span>
+  <span id="res"></span>
+</header>
+
+<main>
+  <div>
+    <canvas id="cv" width="1280" height="960" aria-label="caixas dos rostos detectados"></canvas>
+    <p id="foot"></p>
+  </div>
+  <div>
+    <section>
+      <h2>Rostos na imagem</h2>
+      <table>
+        <thead><tr><th>ID</th><th>semelhança</th><th>X</th><th>Y</th><th>dX</th><th>dY</th><th>time_detected</th><th>na tela</th></tr></thead>
+        <tbody id="faces"><tr><td colspan="8" class="none">aguardando a placa…</td></tr></tbody>
+      </table>
+    </section>
+    <section>
+      <h2>Desempenho</h2>
+      <div class="cards">
+        <div class="card"><span>IA</span><b id="c-ai">–</b><small id="s-ai"></small></div>
+        <div class="card"><span>Detecção</span><b id="c-det">–</b><small id="s-det"></small></div>
+        <div class="card"><span>Reconhecimento</span><b id="c-rec">–</b><small id="s-rec"></small></div>
+        <div class="card"><span>Caixas recebidas</span><b id="c-box">–</b><small id="s-box"></small></div>
+        <div class="card"><span>Recortes</span><b id="c-crop">–</b><small id="s-crop"></small></div>
+        <div class="card"><span>Rede</span><b id="c-net">–</b><small id="s-net"></small></div>
+      </div>
+    </section>
+    <section>
+      <h2>Cadastro</h2>
+      <div class="row"><button id="en">Cadastrar rosto</button><span id="msg"></span></div>
+      <div class="row">
+        <label>apagar ID <input id="did" type="number" min="1"></label>
+        <button class="del" id="del">Apagar</button>
+        <button class="del" id="clr">Apagar todos</button>
+      </div>
+      <div class="row">cadastrados: <b id="ids">–</b></div>
+      <div class="row">
+        <label>qualidade JPEG <input id="q" type="range" min="10" max="95" step="5"> <b id="qv"></b></label>
+      </div>
+      <div class="row">
+        <a href="/capture.jpg" target="_blank">foto do quadro inteiro</a>
+        <a href="/status" target="_blank">status (JSON)</a>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const cv = $('cv'), g = cv.getContext('2d'), q = $('q'), msg = $('msg');
+const KNOWN = '#3ddc84', UNKNOWN = '#ff9f1a';
+const STALE_MS = 700;           /* sem evento "faces" há mais que isso: caixas apagadas */
+
+let W = cv.width, H = cv.height;
+let faces = [], frameT = 0, facesAt = 0, dirty = true, live = false;
+const crops = new Map();        /* trk -> {img, x, y, w, h, cx, cy} */
+let boxEvents = 0, prev = null;
+
+function setLive(on) {
+  live = on;
+  $('live').textContent = on ? 'ao vivo' : 'reconectando…';
+  $('live').className = on ? 'on' : '';
+  if (!on) { faces = []; crops.clear(); prev = null; }
+  dirty = true;
+}
+
+function connect() {
+  const es = new EventSource('/events');
+  es.onopen = () => setLive(true);
+  es.onerror = () => {
+    setLive(false);
+    /* Recusado (ex.: limite de espectadores): o navegador desiste; tenta de novo. */
+    if (es.readyState === EventSource.CLOSED) setTimeout(connect, 2000);
+  };
+  es.addEventListener('faces', e => {
+    const m = JSON.parse(e.data);
+    faces = m.f; frameT = m.t; facesAt = performance.now();
+    boxEvents++; dirty = true;
+    for (const k of crops.keys()) if (!faces.some(f => f.trk === k)) crops.delete(k);
+  });
+  es.addEventListener('crop', e => {
+    const m = JSON.parse(e.data), img = new Image();
+    img.onload = () => {
+      if (!faces.some(f => f.trk === m.trk)) return;
+      m.img = img; delete m.jpg; crops.set(m.trk, m); dirty = true;
+    };
+    img.src = 'data:image/jpeg;base64,' + m.jpg;
+  });
+  es.addEventListener('stats', e => stats(JSON.parse(e.data)));
+}
+
+/* ---- canvas: coordenadas do próprio quadro da câmera ---- */
+function draw() {
+  requestAnimationFrame(draw);
+  if (!dirty) return;
+  dirty = false;
+  const stale = performance.now() - facesAt > STALE_MS;
+  const shown = stale ? [] : faces;
+
+  g.fillStyle = '#05070a'; g.fillRect(0, 0, W, H);
+  g.strokeStyle = 'rgba(255,255,255,.06)'; g.lineWidth = 1;
+  g.beginPath();
+  for (let i = 1; i < 8; i++) { g.moveTo(W * i / 8, 0); g.lineTo(W * i / 8, H); g.moveTo(0, H * i / 8); g.lineTo(W, H * i / 8); }
+  g.stroke();
+  g.strokeStyle = 'rgba(255,255,255,.18)';
+  g.beginPath(); g.moveTo(W / 2 - 20, H / 2); g.lineTo(W / 2 + 20, H / 2); g.moveTo(W / 2, H / 2 - 20); g.lineTo(W / 2, H / 2 + 20); g.stroke();
+
+  const font = Math.round(H / 32), lw = Math.max(2, Math.round(W / 320));
+  for (const f of shown) {
+    const x0 = f.x - f.dx / 2, y0 = f.y - f.dy / 2, color = f.id >= 0 ? KNOWN : UNKNOWN;
+    /* Recorte: chega mais devagar que a caixa; vai junto com ela, só dentro dela. */
+    const c = crops.get(f.trk);
+    if (c) {
+      g.save(); g.beginPath(); g.rect(x0, y0, f.dx, f.dy); g.clip();
+      g.drawImage(c.img, c.x + f.x - c.cx, c.y + f.y - c.cy, c.w, c.h);
+      g.restore();
+    }
+    g.strokeStyle = color; g.lineWidth = lw; g.strokeRect(x0, y0, f.dx, f.dy);
+    g.beginPath(); g.moveTo(f.x - 12, f.y); g.lineTo(f.x + 12, f.y); g.moveTo(f.x, f.y - 12); g.lineTo(f.x, f.y + 12); g.stroke();
+
+    const label = f.id >= 0 ? `ID ${f.id} · ${f.sim}%` : 'desconhecido';
+    g.font = `600 ${font}px system-ui,sans-serif`;
+    const pad = font / 3, lh = font + 2 * pad, tw = g.measureText(label).width + 2 * pad;
+    const ly = y0 - lh >= 0 ? y0 - lh : y0;
+    g.fillStyle = color; g.fillRect(x0, ly, tw, lh);
+    g.fillStyle = '#000'; g.textBaseline = 'top'; g.fillText(label, x0 + pad, ly + pad);
+  }
+
+  if (!shown.length) {
+    g.fillStyle = 'rgba(255,255,255,.3)'; g.font = `${font}px system-ui,sans-serif`;
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillText(live ? 'nenhum rosto' : 'sem conexão com a placa', W / 2, H / 2 + font * 1.5);
+    g.textAlign = 'start';
+  }
+  table(shown);
+}
+
+function table(list) {
+  $('faces').innerHTML = list.length ? list.map(f =>
+    `<tr class="${f.id >= 0 ? 'k' : 'u'}"><td>${f.id}</td><td>${f.id >= 0 ? f.sim + '%' : 'desconhecido'}</td>` +
+    `<td>${f.x}</td><td>${f.y}</td><td>${f.dx}</td><td>${f.dy}</td><td>${frameT}</td>` +
+    `<td>${(f.age / 1000).toFixed(1)} s</td></tr>`).join('')
+    : `<tr><td colspan="8" class="none">${live ? 'nenhum rosto' : 'sem conexão'}</td></tr>`;
+}
+
+/* ---- estatísticas: taxas pela diferença entre dois "stats" (1 por segundo) ---- */
+function card(id, value, sub) { $('c-' + id).textContent = value; $('s-' + id).textContent = sub; }
+
+function stats(s) {
+  if (s.width !== W || s.height !== H) { W = cv.width = s.width; H = cv.height = s.height; dirty = true; }
+  $('res').textContent = `${s.width}×${s.height}`;
+  $('ids').textContent = s.enrolled.length ? s.enrolled.join(', ') : 'nenhum';
+  if (!prev) { q.value = s.quality; $('qv').textContent = s.quality; }
+  const dt = prev ? (s.uptime_ms - prev.uptime_ms) / 1000 : 0;
+  if (dt > 0) {
+    const rate = k => (s[k] - prev[k]) / dt;
+    card('ai', rate('ai_cycles').toFixed(1) + ' q/s', `câmera ${rate('captured').toFixed(1)} q/s`);
+    card('det', (s.detect_us / 1000).toFixed(0) + ' ms', `latência ${(s.latency_us / 1000).toFixed(0)} ms (captura → caixa)`);
+    if (s.recogs) card('rec', (s.recog_us / 1000).toFixed(0) + ' ms', `${rate('recogs').toFixed(1)}/s · ${s.recogs} no total`);
+    else card('rec', '—', 'nenhum ainda');
+    card('box', (boxEvents / dt).toFixed(1) + '/s', 'uma por quadro analisado com rosto');
+    card('crop', rate('crop_sets').toFixed(1) + '/s', `${(s.crop_bytes / 1024).toFixed(1)} KB · ${(s.crop_us / 1000).toFixed(1)} ms para fazer`);
+    card('net', (rate('bytes_sent') * 8 / 1e6).toFixed(2) + ' Mbit/s', `${s.viewers} assistindo`);
+  }
+  boxEvents = 0;
+  $('foot').textContent = `ligada há ${(s.uptime_ms / 1000).toFixed(0)} s · memória livre ${(s.mem_free / 1048576).toFixed(0)} MB` +
+    (s.encode_failed ? ` · ${s.encode_failed} JPEG falharam` : '');
+  prev = s;
+}
+
+/* ---- controles ---- */
+q.oninput = () => $('qv').textContent = q.value;
+q.onchange = () => fetch('/quality?q=' + q.value);
+async function post(url) { const r = await fetch(url, { method: 'POST' }); return r.json(); }
+$('en').onclick = async () => {
+  msg.textContent = 'olhe para a câmera…';
+  try {
+    const j = await post('/enroll');
+    msg.textContent = j.ok ? (j.new ? 'Cadastrado: ID ' + j.id : 'Já cadastrado: ID ' + j.id + ' (' + j.sim + '%)') : j.error;
+  } catch (e) { msg.textContent = 'sem resposta da placa'; }
+};
+$('del').onclick = async () => {
+  const id = $('did').value; if (!id) return;
+  const j = await post('/delete?id=' + id); msg.textContent = j.ok ? 'ID ' + id + ' apagado' : j.error;
+};
+$('clr').onclick = async () => {
+  if (!confirm('Apagar todos os cadastros?')) return;
+  const j = await post('/delete?id=all'); msg.textContent = j.ok ? 'todos apagados' : j.error;
+};
+
+setInterval(() => { dirty = true; }, 250);   /* apaga caixas paradas e mantém a tabela em dia */
+connect();
+draw();
+</script>

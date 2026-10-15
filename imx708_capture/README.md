@@ -3,8 +3,9 @@
 Waveshare ESP32-P4-Module-DEV-KIT (chip rev v1.3, 16 MB de flash). Funciona
 com a **OV5647** (a câmera que vem com o kit; 1280x960, foco fixo) ou com a
 **IMX708** (Pi Camera Module 3; 1280x720, autofoco) — o firmware usa a que
-responder no I2C. A IA detecta e reconhece rostos; o vídeo vai por Wi-Fi
-(ESP32-C6 da placa) como MJPEG, com caixa e ID desenhados em cada rosto.
+responder no I2C. A IA detecta e reconhece rostos; pelo Wi-Fi (ESP32-C6 da
+placa) vão só a caixa de cada rosto, a cada quadro analisado, e a imagem de
+dentro dela — nunca o quadro inteiro. A página desenha as caixas num canvas.
 
 ## Antes do primeiro build
 
@@ -26,17 +27,32 @@ O log termina com `==== abra no navegador: http://<ip>/ ====`.
 
 | | |
 | --- | --- |
-| `GET /` | vídeo com caixas, botão **Cadastrar rosto**, apagar por ID |
-| `GET /stream` | MJPEG puro (VLC, `ffplay`) |
-| `GET /capture.jpg` | uma foto, com as caixas |
-| `GET /status` | JSON: fps, rostos na imagem, IDs cadastrados |
-| `GET /quality?q=N` | qualidade JPEG ao vivo |
+| `GET /` | caixas ao vivo com o rosto dentro, tabela dos rostos, desempenho, cadastro |
+| `GET /events` | Server-Sent Events: `faces`, `crop`, `stats` (abaixo) |
+| `GET /capture.jpg` | uma foto do quadro inteiro, com as caixas (só quando pedida) |
+| `GET /status` | JSON: fps, rostos na imagem, IDs cadastrados (o mesmo do `stats`) |
+| `GET /quality?q=N` | qualidade JPEG dos recortes e da foto |
 | `POST /enroll` | cadastra o maior rosto na imagem e devolve o ID |
 | `POST /delete?id=N` | apaga um ID (`id=all` apaga todos) |
 
-Caixa **verde** com `ID n xx%` = reconhecido (xx = semelhança com o
-cadastro). **Laranja** `DESCONHECIDO` = rosto sem cadastro. Cadastrar quem já
+Caixa **verde** com `ID n · xx%` = reconhecido (xx = semelhança com o
+cadastro). **Laranja** `desconhecido` = rosto sem cadastro. Cadastrar quem já
 está cadastrado devolve o ID existente em vez de duplicar.
+
+### `/events`
+
+Uma conexão por espectador (no máximo 2), cada evento numa linha `data:` JSON:
+
+- `faces` — a cada quadro analisado com rosto (e uma vez quando o último sai):
+  `{"seq","t","f":[{"trk","id","sim","x","y","dx","dy","age"}]}`. `t` =
+  `time_detected` (ms desde o boot); `x,y,dx,dy` como no terminal; `trk`
+  identifica o rosto enquanto ele é seguido; `age` = ms desde que apareceu.
+- `crop` — até 15 por segundo, um por rosto: `{"trk","x","y","w","h","cx","cy","jpg"}`.
+  `jpg` = JPEG em base64 da região `x,y,w,h` do quadro (a caixa arredondada
+  para múltiplos de 16; rosto com mais de 256 px é reduzido). `cx,cy` = centro
+  da caixa naquele quadro: a página desenha o recorte na caixa mais recente,
+  deslocado do quanto ela andou.
+- `stats` — 1 por segundo, o mesmo JSON do `/status`.
 
 Os cadastros ficam em `/spiflash/faces.bin` (partição FAT `storage`) e
 sobrevivem a reboot e a reflash do app; só somem com `idf.py erase-flash` ou
@@ -48,13 +64,15 @@ apagando pela página. O log serial também mostra `reconhecido: ID n`.
 analisado:
 
 ```
-[id,x,y,last_time_frame]
-[1,642,388,22]
+[ID,X,Y,dX,dY,time_detected]
+[1,642,388,180,220,45678]
 ```
 
-`id` = -1 se desconhecido; `x,y` = centro da caixa em pixels (1280x960);
-`last_time_frame` = ms desde o quadro analisado anterior (o período do
-tracking; 22 ms = 45 quadros/s). A cada 5 s sai uma linha `#` com quadros/s
+`ID` = -1 se desconhecido; `X,Y` = centro da caixa e `dX,dY` = largura e
+altura, em pixels do quadro (1280x960); `time_detected` = ms desde o boot em
+que o quadro foi capturado (a diferença entre duas linhas seguidas é o período
+do tracking; 22 ms = 45 quadros/s). A página mostra os mesmos campos na
+tabela "Rostos na imagem". A cada 5 s sai uma linha `#` com quadros/s
 da IA e da câmera, tempo de detecção e de reconhecimento, e latência (do
 quadro capturado ao resultado). Para ver só o tracking:
 `idf.py monitor | grep '^\['`.
@@ -66,11 +84,13 @@ no máximo 2 por quadro. A IA usa o buffer da câmera direto, sem cópia.
 
 ## Como o tempo é dividido
 
-- **core 0** — captura: copia o quadro para a IA (quando ela está livre),
-  desenha as caixas mais recentes e codifica em JPEG por hardware.
-- **core 1** — IA: detecção (MSR+MNP) e reconhecimento (MobileFaceNet) dos até
-  3 maiores rostos, no ritmo que der. O vídeo nunca espera por ela; por isso a
-  caixa segue um rosto em movimento com um ciclo de IA de atraso.
+- **core 0** — captura: entrega o buffer da câmera à IA (quando ela está
+  livre); quando ela devolve, recorta cada caixa e codifica em JPEG por
+  hardware (~2 ms por rosto, até 15 vezes por segundo, só com alguém na
+  página). Também o reconhecimento (MobileFaceNet, ~120 ms por rosto), numa
+  task de prioridade menor.
+- **core 1** — IA: detecção (MSR+MNP) em todo quadro e tracking, no ritmo que
+  der. A captura nunca espera por ela.
 - Caixas e IDs são suavizados entre ciclos: uma detecção perdida não apaga a
   caixa, e o ID só cai depois de 3 ciclos seguidos sem reconhecer.
 
@@ -96,12 +116,12 @@ rosto) e de `main/imx708_capture_main.c` (qualidade, espectadores, cores).
   com a OV5647 — esperado: ela não tem motor de foco.
 - **Câmera não detectada** — o log mostra uma varredura do I2C: 0x1a = IMX708,
   0x36 = OV5647, 0x18 = codec da placa. Só 0x18 = cabo/conector da câmera.
-- **Vídeo congela ~1 s em intervalos regulares** — perda de pacotes entre P4
+- **Caixas congelam ~1 s em intervalos regulares** — perda de pacotes entre P4
   e C6 seguida de retransmissão TCP (RTO de 1,5 s). Resolvido com
   `CONFIG_LWIP_TCP_SND_BUF_DEFAULT=11520`; não aumente esse valor. O log do
   esp_hosted (`stats: STA ... drop[N]`, a cada 10 s) mostra se voltou a perder.
 - **"nenhum rosto" no cadastro** — o detector só pega rosto em pé e de frente.
-- **Página abre mas o vídeo não** — rede pública pode isolar clientes entre si;
+- **Página abre mas fica em "reconectando…"** — rede pública pode isolar clientes entre si;
   teste com o celular como roteador.
 - **Assert em `prvCreateIdleTasks` antes do `app_main`** — RAM interna acabou;
   ver o bloco do esp_hosted no `sdkconfig.defaults`.

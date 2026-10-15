@@ -1,0 +1,4 @@
+sdk/
+third_party/
+build/
+.venv-rknn/

@@ -11,6 +11,7 @@
  */
 #include <algorithm>
 #include <atomic>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -257,6 +258,7 @@ struct track_t {
     int unknown;            /* verificações seguidas sem reconhecer um conhecido */
     int missed;             /* quadros seguidos sem detecção */
     int64_t last_recog_us;  /* último envio para reconhecimento; 0 = nunca */
+    int64_t since_us;       /* quadro em que o rosto apareceu */
     uint32_t gen;           /* muda quando o slot é reaproveitado por outro rosto */
     bool pending;           /* reconhecimento em andamento */
     bool live;
@@ -281,7 +283,7 @@ static float iou(const int *a, const int *b)
 
 /* Liga cada detecção a um track (o de maior IoU, ou um novo). track_of[i] = -1
  * se não sobrou track livre. Tracks sem detecção envelhecem e morrem. */
-static void associate(const std::vector<dl::detect::result_t> &dets, int *track_of)
+static void associate(const std::vector<dl::detect::result_t> &dets, int *track_of, int64_t frame_us)
 {
     bool matched[MAX_TRACKS] = {};
 
@@ -309,6 +311,7 @@ static void associate(const std::vector<dl::detect::result_t> &dets, int *track_
                 s_tracks[best].live = true;
                 s_tracks[best].id = -1;
                 s_tracks[best].gen = s_next_gen++;
+                s_tracks[best].since_us = frame_us;
             }
         }
         track_of[i] = best;
@@ -357,25 +360,25 @@ static void apply_recog(track_t &t, bool ok, int id, float sim)
 /* ---- Resultado publicado ------------------------------------------------------ */
 
 static SemaphoreHandle_t s_res_lock;
-static face_box_t s_res[FACE_MAX_BOXES];
-static size_t s_res_n;
+static face_result_t s_res;
 static int64_t s_res_time;
 static face_stats_t s_stats;
 
-static void publish()
+static void publish(int64_t frame_us)
 {
-    face_box_t out[FACE_MAX_BOXES];
-    size_t n = 0;
-    for (int j = 0; j < MAX_TRACKS && n < FACE_MAX_BOXES; j++) {
+    face_result_t out = {};
+    for (int j = 0; j < MAX_TRACKS && out.n < FACE_MAX_BOXES; j++) {
         const track_t &t = s_tracks[j];
         if (t.live) {
-            out[n++] = {(int16_t)t.box[0], (int16_t)t.box[1], (int16_t)t.box[2], (int16_t)t.box[3],
-                        (int16_t)t.id, (uint8_t)std::clamp((int)(t.sim * 100), 0, 100)};
+            out.box[out.n++] = {(int16_t)t.box[0], (int16_t)t.box[1], (int16_t)t.box[2], (int16_t)t.box[3],
+                                (int16_t)t.id, (uint8_t)std::clamp((int)(t.sim * 100), 0, 100), t.gen,
+                                t.since_us};
         }
     }
+    out.frame_us = frame_us;
     xSemaphoreTake(s_res_lock, portMAX_DELAY);
-    memcpy(s_res, out, n * sizeof(out[0]));
-    s_res_n = n;
+    out.seq = s_res.seq + 1;
+    s_res = out;
     s_res_time = esp_timer_get_time();
     xSemaphoreGive(s_res_lock);
 }
@@ -462,7 +465,7 @@ static void recog_task(void *)
             finish_enroll({FACE_ENROLL_FAILED, -1, 0});
         }
 
-        s_recog_count.fetch_add(1);
+        s_stats.recogs = s_recog_count.fetch_add(1) + 1;
         s_recog_total_us.fetch_add(t1 - t0);
         s_stats.recog_us = (uint32_t)(t1 - t0);
         xQueueSend(s_results, &r, 0);
@@ -526,14 +529,16 @@ static int pick_recog(const std::vector<dl::detect::result_t> &dets, const int *
 
 /*
  * Saída no terminal, uma linha por rosto em cada quadro analisado:
- *     [id,x,y,last_time_frame]
- * id = -1 se desconhecido; x,y = centro da caixa em pixels do quadro;
- * last_time_frame = ms desde o quadro analisado anterior (o período do
- * tracking). A cada SUMMARY_US, uma linha "#" com taxas e tempos médios.
+ *     [ID,X,Y,dX,dY,time_detected]
+ * ID = -1 se desconhecido; X,Y = centro da caixa e dX,dY = largura e altura,
+ * em pixels do quadro; time_detected = ms desde o boot em que o quadro foi
+ * capturado (a diferença entre duas linhas é o período do tracking). A cada
+ * SUMMARY_US, uma linha "#" com taxas e tempos médios.
  */
 static void ai_task(void *)
 {
-    int64_t prev_frame_us = 0;
+    printf("# rostos: [ID,X,Y,dX,dY,time_detected]  ID -1 = desconhecido | X,Y = centro (px) | "
+           "dX,dY = largura,altura (px) | time_detected = ms desde o boot\n");
     int64_t sum_start = esp_timer_get_time();
     uint32_t sum_cycles = 0, sum_faces = 0, sum_seen0 = s_frames_seen.load();
     uint32_t sum_recog0 = s_recog_count.load();
@@ -589,7 +594,7 @@ static void ai_task(void *)
         }
 
         int track_of[MAX_TRACKS];
-        associate(dets, track_of);
+        associate(dets, track_of, frame_us);
 
         bool gave_frame = false;
         if (!s_recog_busy.load()) {
@@ -601,26 +606,26 @@ static void ai_task(void *)
             }
         }
 
-        /* Publica antes de devolver o buffer: se a captura for desenhar as
-         * caixas neste mesmo quadro para a web, desenha as dele. */
-        publish();
+        /* Publica antes de devolver o buffer: a captura recorta as caixas
+         * deste mesmo quadro para a web, então elas têm de ser as dele. */
+        publish(frame_us);
         if (!gave_frame) {
             s_release(s_img_index, true);
         }
         int64_t done_us = esp_timer_get_time();
 
-        int dt_ms = prev_frame_us ? (int)((frame_us - prev_frame_us) / 1000) : 0;
-        prev_frame_us = frame_us;
         for (size_t i = 0; i < dets.size(); i++) {
             if (track_of[i] < 0) {
                 continue;
             }
             const track_t &t = s_tracks[track_of[i]];
-            printf("[%d,%d,%d,%d]\n", t.id, (t.box[0] + t.box[2]) / 2, (t.box[1] + t.box[3]) / 2, dt_ms);
+            printf("[%d,%d,%d,%d,%d,%" PRId64 "]\n", t.id, (t.box[0] + t.box[2]) / 2, (t.box[1] + t.box[3]) / 2,
+                   t.box[2] - t.box[0], t.box[3] - t.box[1], frame_us / 1000);
         }
 
         s_stats.cycles++;
         s_stats.detect_us = (uint32_t)(t1 - t0);
+        s_stats.latency_us = (uint32_t)(done_us - frame_us);
 
         sum_cycles++;
         sum_faces += dets.size();
@@ -712,19 +717,19 @@ bool face_offer_frame(uint8_t *rgb565, int buf_index)
     return true;
 }
 
-size_t face_get_boxes(face_box_t *out, size_t max, uint32_t max_age_ms)
+void face_get_result(face_result_t *out, uint32_t max_age_ms)
 {
+    *out = {};
     if (!s_res_lock) {
-        return 0;
+        return;
     }
     xSemaphoreTake(s_res_lock, portMAX_DELAY);
-    size_t n = 0;
-    if (esp_timer_get_time() - s_res_time <= (int64_t)max_age_ms * 1000) {
-        n = std::min(max, s_res_n);
-        memcpy(out, s_res, n * sizeof(out[0]));
-    }
+    *out = s_res;
+    bool stale = esp_timer_get_time() - s_res_time > (int64_t)max_age_ms * 1000;
     xSemaphoreGive(s_res_lock);
-    return n;
+    if (stale) {
+        out->n = 0;
+    }
 }
 
 face_enroll_result_t face_enroll(uint32_t timeout_ms)
