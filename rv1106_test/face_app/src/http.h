@@ -15,6 +15,7 @@ struct HttpRequest {
     std::string method;
     std::string path;
     std::string query;   /* sem o "?" */
+    std::string body;    /* inteiro (até MAX_BODY, em http.cpp) */
 };
 
 using HttpHandler = std::function<void(HttpRequest &)>;
@@ -29,4 +30,8 @@ public:
 /* false = o cliente foi embora. */
 bool http_send_all(int fd, const char *data, size_t len);
 bool http_respond(int fd, const char *status, const char *type, const std::string &body);
+/* Corpo binário; extra = linhas de cabeçalho a mais, cada uma com "\r\n". */
+bool http_respond(int fd, const char *status, const char *type, const void *body, size_t len, const char *extra);
 bool http_query_value(const std::string &query, const char *key, std::string &out);
+/* %XX e "+" de um valor da query. */
+std::string http_url_decode(const std::string &s);

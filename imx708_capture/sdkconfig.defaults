@@ -103,3 +103,18 @@ CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_CAMERA_OV5647_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE=y
 CONFIG_CAMERA_OV5647_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE_PATH="cfg/ov5647_noaf.json"
 CONFIG_CAMERA_OV5647_ENABLE_MOTOR_BY_GPIO0=n
+
+# ---------------------------------------------------------------------------
+# Página de fala (main/asr.c): os modelos do ESP-SR que vão para a partição
+# "model". O MultiNet7 só existe em inglês e chinês; o WakeNet10 tem "Olá ESP".
+# São opções novas (o componente esp-sr ainda não estava no sdkconfig), então
+# valem mesmo com o sdkconfig atual.
+CONFIG_SR_WN_WN10_PT_OLAESP=y
+CONFIG_SR_MN_EN_MULTINET7_QUANT=y
+CONFIG_SR_VADN_VADNET1_MEDIUM=y
+
+# Cada ponto de montagem e cada /dev ocupa um VFS: null, uart, usbserjtag,
+# console, video0 (CSI), video20 (ISP), FAT /spiflash e FAT /clips já são 8,
+# o limite padrão. Com 8 o esp_netif_init (sockets do lwip = 9º) dava
+# ESP_ERR_NO_MEM em esp_vfs_lwip_sockets_register e a placa reiniciava em loop.
+CONFIG_VFS_MAX_COUNT=16

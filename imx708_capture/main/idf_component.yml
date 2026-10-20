@@ -12,3 +12,10 @@ dependencies:
   # fábrica do C6 nas placas Waveshare (a 3.x nunca foi testada contra ele).
   espressif/esp_hosted: ~2.12.12
   espressif/esp_wifi_remote: ^1.6
+  # Driver do codec ES8311 (microfone da placa); é o mesmo que os exemplos do
+  # ESP-SR usam, então serve para wake word depois.
+  espressif/esp_codec_dev: ~1.6
+  # Página de fala: WakeNet10 "Olá ESP", MultiNet7 (inglês) e AFE. Pede
+  # esp-dl ~3.3.12 - a mesma linha dos modelos de rosto (3.3.13 no lock).
+  # Os modelos vão para a partição "model" (srmodels.bin, no idf.py flash).
+  espressif/esp-sr: ~2.6.0

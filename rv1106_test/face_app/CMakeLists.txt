@@ -15,6 +15,7 @@ find_package(Threads REQUIRED)
 
 add_executable(face_app
     src/main.cpp
+    src/asr.cpp
     src/camera.cpp
     src/face.cpp
     src/models.cpp
@@ -49,6 +50,6 @@ set_target_properties(face_app PROPERTIES INSTALL_RPATH "$ORIGIN/lib")
 # Pasta pronta para mandar para a placa.
 set(MODELS ${RV1106_THIRD_PARTY}/luckfox_pico_rknn_example/example/luckfox_pico_retinaface_facenet/model)
 install(TARGETS face_app DESTINATION .)
-install(FILES www/index.html DESTINATION .)
+install(FILES www/index.html www/asr.html DESTINATION .)
 install(FILES ${RKMPI}/lib/uclibc/librknnmrt.so ${RKMPI}/lib/uclibc/librga.so DESTINATION lib)
 install(FILES ${MODELS}/RetinaFace.rknn ${MODELS}/mobilefacenet.rknn DESTINATION model)

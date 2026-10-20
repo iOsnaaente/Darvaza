@@ -49,3 +49,12 @@ idf_build_set_property(ESP_IPA_JSON_CONFIG_FILE_PATH "${imx708_ipa_json}" APPEND
 idf_build_set_property(CAMERA_IPA_JSONS_RESOLVED "${imx708_ipa_json}")
 
 project(imx708_capture)
+
+# O esp-sr registra no esp-dl a lista de ops que o WakeNet usa
+# (tool/esp-sr-req.yml), e com qualquer lista registrada o esp-dl compila SÓ
+# os ops listados. Os modelos de rosto não registram a deles: sem isto o
+# detector e o reconhecedor deixariam de carregar ("no Conv kernel" ou op
+# desconhecido). Sem nenhuma lista o esp-dl compila tudo, como antes do
+# esp-sr. Tem que vir depois de project(): o esp-dl só lê a lista no fim da
+# configuração (cmake_language DEFER), depois desta linha.
+idf_build_set_property(ESPDL_COMPILE_REQS "")

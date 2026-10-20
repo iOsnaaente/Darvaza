@@ -10,18 +10,26 @@
  *                         faces - caixas e IDs, a cada quadro analisado
  *                         crop  - JPEG (base64) só da caixa de cada rosto
  *                         stats - o mesmo JSON do /status, 1 por segundo
+ *   GET  /events?view=full  o mesmo, sem "crop" (a imagem vem do /frame.jpg)
+ *   GET  /frame.jpg?after=N  o próximo quadro inteiro depois do N, em JPEG;
+ *                         as caixas dele vão no cabeçalho X-Faces
  *   GET  /capture.jpg   uma foto do quadro inteiro, com as caixas (sob demanda)
  *   GET  /status        contadores, rostos na imagem e IDs cadastrados (JSON)
  *   GET  /quality?q=N   qualidade JPEG ao vivo (1..100)
  *   POST /enroll        cadastra o maior rosto da imagem; devolve o ID
  *   POST /delete?id=N   apaga um cadastro (id=all apaga todos)
+ *   GET  /asr ...       medição de reconhecimento de fala (asr.h)
  *
  * Pipeline: sensor -> ISP + 3A (rkaiq) -> VI NV12 1280x960 (camera.cpp) -> IA
  * (no próprio buffer da câmera; o RGA reduz para a NPU) -> recorte de cada
- * caixa -> JPEG por hardware (MPP) -> "últimos recortes" publicados. O quadro
- * inteiro não vai para a rede: a página recebe as caixas (poucos bytes, a
- * cada quadro) e desenha ela mesma, e recebe a imagem só de dentro das
- * caixas.
+ * caixa -> JPEG por hardware (MPP) -> "últimos recortes" publicados. Por
+ * padrão o quadro inteiro não vai para a rede: a página recebe as caixas
+ * (poucos bytes, a cada quadro) e desenha ela mesma, e recebe a imagem só de
+ * dentro das caixas. Quem quer a imagem inteira pede um quadro por vez ao
+ * /frame.jpg, e só pede o próximo quando o anterior chegou: nunca há mais de
+ * um quadro na rede, então a imagem não acumula atraso nos buffers do caminho
+ * (TCP, adb). Cada quadro é codificado só quando pedido, numa thread própria
+ * para não atrasar a captura.
  *
  * A IA (face.cpp) roda numa thread própria, no ritmo dela; a captura nunca
  * espera por ela e usa sempre o resultado mais recente.
@@ -39,19 +47,23 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <ifaddrs.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <opencv2/core.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include "asr.h"
 #include "camera.h"
 #include "face.h"
 #include "http.h"
@@ -70,11 +82,18 @@ static const char *TAG = "face_app";
  * reduzido pulando pixels: a banda fica limitada mesmo com o rosto colado. */
 #define CROP_MAX_PX         256
 
+/* Imagem inteira: no máximo isto de quadros por segundo (cada um custa ~30 ms
+ * de RGA + JPEG; o resto do tempo é da IA). O ritmo real é o da rede: a
+ * página pede o próximo quando o anterior chega. */
+#define FRAME_MAX_FPS       15
+/* Quadro pronto mais velho que isto não serve para quem pede: espera um novo. */
+#define FRAME_FRESH_MS      300
+
 #define MAX_VIEWERS         2
 #define EVENTS_POLL_MS      5       /* de quanto em quanto o espectador olha se há novidade */
 #define STATS_PERIOD_US     (1000 * 1000)
 
-/* Quanto a foto (/capture.jpg) espera um quadro novo. */
+/* Quanto a foto (/capture.jpg) e a imagem inteira (/frame.jpg) esperam um quadro novo. */
 #define FRAME_WAIT_MS       3000
 
 /* ---- Caixas (as desenhadas na foto; a página desenha as dela) --------------- */
@@ -97,12 +116,15 @@ struct options_t {
     float thr = 0.60f;
     std::string db = "/userdata/faces.bin";
     std::string models;   /* padrão: <pasta do executável>/model/ */
+    std::string asr = "/root/asr_bench";
 };
 
 /* ---- Estado ---------------------------------------------------------------- */
 
 static std::atomic<bool> s_stop{false};
 static bool s_camera_ok;
+/* Medição de fala pediu a CPU só para ela: a captura segue, a IA não recebe quadros. */
+static std::atomic<bool> s_ai_paused{false};
 static int s_w, s_h;
 
 static std::atomic<int> s_quality{JPEG_QUALITY_DEFAULT};
@@ -111,12 +133,17 @@ static std::atomic<int> s_quality{JPEG_QUALITY_DEFAULT};
  * e o terminal continua mostrando os rostos sem ninguém na página. */
 static std::atomic<int> s_photo_waiters{0};
 static std::atomic<int> s_viewers{0};
+static std::atomic<int> s_full_viewers{0};  /* dos s_viewers, os da imagem inteira */
 
 static struct {
     std::atomic<uint32_t> captured{0};
     std::atomic<uint32_t> crop_sets{0};     /* conjuntos de recortes publicados */
     std::atomic<uint32_t> crop_bytes{0};    /* tamanho do último conjunto (eventos com base64) */
     std::atomic<uint32_t> crop_us{0};       /* último conjunto: cópia + JPEG + base64 */
+    std::atomic<uint32_t> frame_sets{0};    /* quadros inteiros codificados */
+    std::atomic<uint32_t> frame_bytes{0};   /* JPEG do último */
+    std::atomic<uint32_t> frame_us{0};      /* último: conversão + JPEG */
+    std::atomic<uint32_t> frames_sent{0};   /* respostas do /frame.jpg */
     std::atomic<uint32_t> photos{0};
     std::atomic<uint32_t> encode_failed{0};
     std::atomic<uint64_t> bytes_sent{0};    /* tudo que saiu pelo /events */
@@ -132,6 +159,23 @@ static std::mutex s_crops_lock;
 static std::string s_crops_latest;
 static std::atomic<uint32_t> s_crops_seq{0};
 
+/* Imagem inteira. s_frame_want = alguém pediu um quadro novo: a captura passa
+ * o próximo quadro analisado (com as caixas dele) por s_full_frame, e
+ * full_frame_loop o converte, codifica e publica em s_frame_*. */
+static std::atomic<bool> s_frame_want{false};
+static std::mutex s_full_lock;
+static std::condition_variable s_full_cv;
+static FramePtr s_full_frame;
+static face_result_t s_full_res;
+
+static std::mutex s_frame_lock;
+static std::condition_variable s_frame_cv;
+static std::vector<uchar> s_frame_jpg;
+static std::string s_frame_faces;   /* caixas daquele quadro, JSON como no "faces" */
+static int64_t s_frame_t_us;        /* captura do quadro */
+static int64_t s_frame_pub_us;      /* quando ficou pronto */
+static uint32_t s_frame_seq;
+
 /* Foto do quadro inteiro. */
 static std::mutex s_photo_lock;
 static std::condition_variable s_photo_cv;
@@ -140,8 +184,14 @@ static uint32_t s_photo_seq;
 
 /* ---- Captura, recortes e foto --------------------------------------------- */
 
+static void faces_json(std::string &s, const face_result_t &r);
+
+/* Chamada pela captura (recortes, foto) e pela thread da imagem inteira: um
+ * JPEG por vez no encoder de hardware. */
 static bool encode_jpeg(const cv::Mat &img, std::vector<uchar> &out)
 {
+    static std::mutex s_encoder_lock;
+    std::lock_guard<std::mutex> lock(s_encoder_lock);
     std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, s_quality.load()};
     if (!cv::imencode(".jpg", img, out, params)) {
         s_stats.encode_failed++;
@@ -203,9 +253,9 @@ static crop_t crop_region(const face_box_t *b)
 }
 
 /*
- * Recorta cada rosto deste quadro, se alguém assiste e já deu o intervalo de
- * CROP_MAX_FPS. Só para quadros que a IA acabou de analisar: as caixas
- * publicadas são as deles, então o recorte cai exatamente no rosto.
+ * Recorta cada rosto deste quadro, se alguém assiste só os rostos e já deu o
+ * intervalo de CROP_MAX_FPS. Só para quadros que a IA acabou de analisar: as
+ * caixas publicadas são as deles, então o recorte cai exatamente no rosto.
  *
  * Cada evento leva a região recortada (x,y,w,h, em pixels do quadro) e o
  * centro da caixa naquele quadro (cx,cy): a página desenha o recorte na
@@ -214,7 +264,7 @@ static crop_t crop_region(const face_box_t *b)
 static void maybe_send_crops(const Frame &frame, int64_t *last_us)
 {
     int64_t now = now_us();
-    if (s_viewers.load() <= 0 || now - *last_us < 1000000 / CROP_MAX_FPS) {
+    if (s_viewers.load() - s_full_viewers.load() <= 0 || now - *last_us < 1000000 / CROP_MAX_FPS) {
         return;
     }
     face_result_t res;
@@ -272,6 +322,85 @@ static void maybe_encode_photo(const Frame &frame)
     s_stats.photos++;
 }
 
+/*
+ * Passa o quadro para a thread da imagem inteira, se alguém pediu um quadro
+ * novo e já deu o intervalo de FRAME_MAX_FPS. analyzed = a IA acabou de
+ * analisá-lo: as caixas vão junto e precisam ser as dele (se ela já publicou
+ * um quadro mais novo, este fica de fora). Sem IA, vai sem caixas.
+ */
+static void maybe_offer_full(const FramePtr &frame, bool analyzed, int64_t *last_us)
+{
+    int64_t now = now_us();
+    if (!s_frame_want.load() || now - *last_us < 1000000 / FRAME_MAX_FPS) {
+        return;
+    }
+    face_result_t res;
+    face_get_result(&res, BOX_MAX_AGE_MS);
+    if (!analyzed) {
+        res.n = 0;
+    } else if (res.frame_us != frame->t_us) {
+        return;
+    }
+    *last_us = now;
+    s_frame_want = false;
+    {
+        std::lock_guard<std::mutex> lock(s_full_lock);
+        s_full_frame = frame;
+        s_full_res = res;
+    }
+    s_full_cv.notify_one();
+}
+
+/*
+ * Thread da imagem inteira: RGA para BGR e JPEG, e publica o quadro com as
+ * caixas dele para o /frame.jpg. Fora da captura, que nunca espera por ela;
+ * e com prioridade menor, para não tirar CPU da IA e da captura (o RV1106
+ * tem um núcleo só). O buffer da câmera volta logo depois do RGA.
+ */
+static void full_frame_loop()
+{
+    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);
+    std::vector<uchar> jpg;
+    std::string faces;
+
+    while (!s_stop) {
+        FramePtr f;
+        face_result_t res;
+        {
+            std::unique_lock<std::mutex> lock(s_full_lock);
+            s_full_cv.wait_for(lock, std::chrono::milliseconds(500), [] { return s_full_frame != nullptr; });
+            f = std::move(s_full_frame);
+            res = s_full_res;
+        }
+        if (!f) {
+            continue;
+        }
+        int64_t t0 = now_us();
+        int64_t t_us = f->t_us;
+        cv::Mat bgr = frame_to_bgr_full(*f);
+        f.reset();      /* a imagem já está num buffer nosso */
+        if (bgr.empty() || !encode_jpeg(bgr, jpg)) {
+            s_frame_want = true;    /* quem pediu continua esperando: tenta o próximo */
+            continue;
+        }
+        faces.clear();
+        faces_json(faces, res);
+        int64_t done = now_us();
+        s_stats.frame_us = (uint32_t)(done - t0);
+        s_stats.frame_bytes = (uint32_t)jpg.size();
+        {
+            std::lock_guard<std::mutex> lock(s_frame_lock);
+            s_frame_jpg.swap(jpg);
+            s_frame_faces.swap(faces);
+            s_frame_t_us = t_us;
+            s_frame_pub_us = done;
+            s_frame_seq++;
+        }
+        s_frame_cv.notify_all();
+        s_stats.frame_sets++;
+    }
+}
+
 static void face_release(const FramePtr &frame)
 {
     std::lock_guard<std::mutex> lock(s_rel_lock);
@@ -281,12 +410,13 @@ static void face_release(const FramePtr &frame)
 /*
  * Prioridade é a IA: cada quadro novo vai para ela, sem cópia, e ela analisa
  * sempre o mais novo. O quadro analisado volta (por s_released) quando ela
- * termina - e aí, se for a vez da web, as caixas dele são recortadas e a foto
- * sai dele. Sem IA (falhou ao iniciar), a foto sai direto da captura.
+ * termina - e aí, se for a vez da web, as caixas dele são recortadas, ele vai
+ * para a imagem inteira e a foto sai dele. Sem IA (falhou ao iniciar), a
+ * imagem inteira e a foto saem direto da captura.
  */
 static void capture_loop()
 {
-    int64_t last_crop_us = 0;
+    int64_t last_crop_us = 0, last_full_us = 0;
     int misses = 0;
 
     while (!s_stop) {
@@ -301,6 +431,7 @@ static void capture_loop()
                 s_released.pop_front();
             }
             maybe_send_crops(*done, &last_crop_us);
+            maybe_offer_full(done, true, &last_full_us);
             maybe_encode_photo(*done);
         }
 
@@ -314,9 +445,10 @@ static void capture_loop()
         misses = 0;
         s_stats.captured++;
 
-        if (face_offer_frame(f)) {
+        if (!s_ai_paused && face_offer_frame(f)) {
             continue;   /* está com a IA; volta por s_released */
         }
+        maybe_offer_full(f, false, &last_full_us);
         maybe_encode_photo(*f);
     }
 }
@@ -351,17 +483,20 @@ static void status_json(std::string &s)
     face_get_result(&res, BOX_MAX_AGE_MS);
 
     appendf(s,
-            "{\"width\":%d,\"height\":%d,\"quality\":%d,\"viewers\":%d,\"uptime_ms\":%lld,"
+            "{\"width\":%d,\"height\":%d,\"quality\":%d,\"viewers\":%d,\"viewers_full\":%d,\"uptime_ms\":%lld,"
             "\"captured\":%u,\"crop_sets\":%u,\"crop_bytes\":%u,\"crop_us\":%u,"
+            "\"frame_sets\":%u,\"frame_bytes\":%u,\"frame_us\":%u,\"frames_sent\":%u,"
             "\"photos\":%u,\"encode_failed\":%u,\"bytes_sent\":%llu,",
-            s_w, s_h, s_quality.load(), s_viewers.load(), (long long)(now_us() / 1000), s_stats.captured.load(),
-            s_stats.crop_sets.load(), s_stats.crop_bytes.load(), s_stats.crop_us.load(), s_stats.photos.load(),
+            s_w, s_h, s_quality.load(), s_viewers.load(), s_full_viewers.load(), (long long)(now_us() / 1000),
+            s_stats.captured.load(), s_stats.crop_sets.load(), s_stats.crop_bytes.load(), s_stats.crop_us.load(),
+            s_stats.frame_sets.load(), s_stats.frame_bytes.load(), s_stats.frame_us.load(), s_stats.frames_sent.load(),
+            s_stats.photos.load(),
             s_stats.encode_failed.load(), (unsigned long long)s_stats.bytes_sent.load());
     appendf(s,
-            "\"ai_cycles\":%u,\"detect_us\":%u,\"latency_us\":%u,\"recogs\":%u,\"recog_us\":%u,"
+            "\"ai_cycles\":%u,\"ai_paused\":%s,\"detect_us\":%u,\"latency_us\":%u,\"recogs\":%u,\"recog_us\":%u,"
             "\"mem_free\":%llu,\"t\":%lld,\"faces\":",
-            ai.cycles, ai.detect_us, ai.latency_us, ai.recogs, ai.recog_us, (unsigned long long)mem_available(),
-            (long long)(res.frame_us / 1000));
+            ai.cycles, s_ai_paused ? "true" : "false", ai.detect_us, ai.latency_us, ai.recogs, ai.recog_us,
+            (unsigned long long)mem_available(), (long long)(res.frame_us / 1000));
     faces_json(s, res);
 
     int ids[64];
@@ -397,7 +532,8 @@ static const char SSE_HEADERS[] =
  * EVENTS_POLL_MS se há:
  *   - resultado novo da IA com rosto (ou o primeiro sem rosto depois de ter
  *     tido): evento "faces" - a caixa de cada rosto, a cada quadro analisado;
- *   - conjunto novo de recortes: os eventos "crop" já prontos;
+ *   - conjunto novo de recortes: os eventos "crop" já prontos (não com
+ *     ?view=full: aí a imagem vem do /frame.jpg);
  *   - 1 s desde o último "stats".
  * Se o link for mais lento que a IA, só o mais recente de cada um sai.
  */
@@ -412,11 +548,16 @@ static void events_handler(HttpRequest &req)
         http_respond(req.fd, "503 Service Unavailable", "text/plain", "limite de espectadores atingido\n");
         return;
     }
+    std::string view;
+    const bool full = http_query_value(req.query, "view", view) && view == "full";
+    if (full) {
+        s_full_viewers++;
+    }
     /* Sem isto, o Nagle segura cada evento até o ACK do anterior, que o
      * navegador atrasa (delayed ACK): as caixas chegariam aos trancos. */
     int one = 1;
     setsockopt(req.fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    LOGI(TAG, "espectador entrou (%d assistindo)", s_viewers.load());
+    LOGI(TAG, "espectador entrou (%d assistindo; %s)", s_viewers.load(), full ? "imagem inteira" : "só os rostos");
 
     int64_t t_start = now_us();
     uint32_t events = 0, face_seq = 0, crop_seq = s_crops_seq.load();
@@ -439,7 +580,7 @@ static void events_handler(HttpRequest &req)
             events++;
         }
 
-        if (ok && s_crops_seq.load() != crop_seq) {
+        if (ok && !full && s_crops_seq.load() != crop_seq) {
             {
                 std::lock_guard<std::mutex> lock(s_crops_lock);
                 crops = s_crops_latest;
@@ -459,6 +600,9 @@ static void events_handler(HttpRequest &req)
         usleep(EVENTS_POLL_MS * 1000);
     }
 
+    if (full) {
+        s_full_viewers--;
+    }
     s_viewers.fetch_sub(1);
     LOGI(TAG, "espectador saiu depois de %lld s (%u eventos de caixas)", (long long)((now_us() - t_start) / 1000000),
          events);
@@ -498,6 +642,54 @@ static void capture_handler(HttpRequest &req)
         return;
     }
     http_respond(req.fd, "200 OK", "image/jpeg", std::string(jpg.begin(), jpg.end()));
+}
+
+/*
+ * Imagem inteira, um quadro por pedido: o próximo depois de ?after=N (o
+ * número do último que a página recebeu), em JPEG binário, com as caixas
+ * dele no cabeçalho. Se o pronto já foi visto ou é velho, pede um novo à
+ * captura e espera. Ao responder, já pede o seguinte: ele fica pronto
+ * enquanto este viaja, e a página o recebe sem esperar a codificação.
+ */
+static void frame_handler(HttpRequest &req)
+{
+    if (!s_camera_ok) {
+        http_respond(req.fd, "503 Service Unavailable", "text/plain", "a camera nao iniciou - veja o log\n");
+        return;
+    }
+    std::string val;
+    const uint32_t after = http_query_value(req.query, "after", val) ? (uint32_t)strtoul(val.c_str(), nullptr, 10) : 0;
+
+    std::vector<uchar> jpg;
+    std::string faces;
+    uint32_t seq;
+    int64_t t_us;
+    {
+        std::unique_lock<std::mutex> lock(s_frame_lock);
+        auto ready = [after] { return s_frame_seq != after && now_us() - s_frame_pub_us < FRAME_FRESH_MS * 1000; };
+        if (!ready()) {
+            s_frame_want = true;
+            if (!s_frame_cv.wait_for(lock, std::chrono::milliseconds(FRAME_WAIT_MS), ready)) {
+                lock.unlock();
+                http_respond(req.fd, "503 Service Unavailable", "text/plain", "camera sem quadros\n");
+                return;
+            }
+        }
+        jpg = s_frame_jpg;
+        faces = s_frame_faces;
+        seq = s_frame_seq;
+        t_us = s_frame_t_us;
+    }
+    s_frame_want = true;
+
+    std::string extra;
+    appendf(extra,
+            "X-Frame-Seq: %u\r\nX-Frame-T: %lld\r\nX-Faces: %s\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Expose-Headers: X-Frame-Seq, X-Frame-T, X-Faces\r\n",
+            seq, (long long)(t_us / 1000), faces.c_str());
+    http_respond(req.fd, "200 OK", "image/jpeg", jpg.data(), jpg.size(), extra.c_str());
+    s_stats.frames_sent++;
 }
 
 static void status_handler(HttpRequest &req)
@@ -575,10 +767,12 @@ static bool start_server(int port)
     server.on("GET", "/", index_handler);
     server.on("GET", "/events", events_handler);
     server.on("GET", "/capture.jpg", capture_handler);
+    server.on("GET", "/frame.jpg", frame_handler);
     server.on("GET", "/status", status_handler);
     server.on("GET", "/quality", quality_handler);
     server.on("POST", "/enroll", enroll_handler);
     server.on("POST", "/delete", delete_handler);
+    asr_routes(server);
     /* O navegador sempre pede; 204 evita um 404 a cada visita. */
     server.on("GET", "/favicon.ico", [](HttpRequest &req) {
         static const char NO_CONTENT[] = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
@@ -636,20 +830,22 @@ static void print_urls(int port)
         }
         freeifaddrs(ifs);
     }
-    LOGI(TAG, "%spela USB (adb): adb forward tcp:8080 tcp:%d e abra http://localhost:8080/",
+    LOGI(TAG, "%spela USB (adb): adb forward tcp:8080 tcp:%d e abra http://127.0.0.1:8080/",
          any ? "ou " : "sem rede; ", port);
 }
 
 static void usage(const char *argv0)
 {
     printf("uso: %s [--port N] [--width N --height N] [--fps N] [--hz 50|60] [--thr 0..1] [--db arquivo] [--models pasta]\n"
+           "       [--asr pasta]\n"
            "  --port    porta HTTP (80)\n"
            "  --width/--height  quadro da câmera (1280x960)\n"
            "  --fps     quadros/s fixos da câmera; 0 = automático (30)\n"
            "  --hz      frequência da rede elétrica, para o antiflicker (60)\n"
            "  --thr     semelhança mínima para reconhecer (0.60)\n"
            "  --db      arquivo dos cadastros (/userdata/faces.bin)\n"
-           "  --models  pasta com RetinaFace.rknn e mobilefacenet.rknn (<pasta do app>/model)\n",
+           "  --models  pasta com RetinaFace.rknn e mobilefacenet.rknn (<pasta do app>/model)\n"
+           "  --asr     pasta do asr_bench, para a página /asr (/root/asr_bench)\n",
            argv0);
 }
 
@@ -681,6 +877,8 @@ static bool parse_args(int argc, char **argv, options_t &opt)
             opt.db = v;
         } else if (a == "--models") {
             opt.models = v;
+        } else if (a == "--asr") {
+            opt.asr = v;
         } else {
             fprintf(stderr, "opção desconhecida: %s\n", a.c_str());
             return false;
@@ -724,6 +922,10 @@ int main(int argc, char **argv)
         LOGE(TAG, "==== reconhecimento facial falhou - seguindo sem IA ====");
     }
 
+    asr_init(opt.asr, [](bool pause) {
+        s_ai_paused = pause;
+        LOGI(TAG, "IA de rostos %s", pause ? "parada durante a medição de fala" : "de volta");
+    });
     if (!start_server(opt.port)) {
         LOGE(TAG, "==== servidor HTTP falhou ====");
         return 1;
@@ -731,6 +933,7 @@ int main(int argc, char **argv)
     print_urls(opt.port);
 
     if (s_camera_ok) {
+        std::thread(full_frame_loop).detach();
         capture_loop();
     } else {
         while (!s_stop) {

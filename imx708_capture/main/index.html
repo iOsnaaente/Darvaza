@@ -8,10 +8,18 @@
   --known:#3ddc84;--unknown:#ff9f1a;--bad:#ff5c5c;--accent:#4aa3ff}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,sans-serif}
-header{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line)}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line)}
 header h1{font-size:16px;margin:0;font-weight:600}
+nav{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+nav a{padding:4px 12px;color:var(--dim);text-decoration:none}
+nav a+a{border-left:1px solid var(--line)}
+nav a[aria-current=page]{background:var(--accent);color:#000;font-weight:600}
 #live{font-size:12px;padding:2px 10px;border-radius:999px;background:#3a1d1d;color:var(--bad)}
 #live.on{background:#173524;color:var(--known)}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.seg button{background:transparent;color:var(--dim);border-radius:0;padding:4px 12px}
+.seg button+button{border-left:1px solid var(--line)}
+.seg button[aria-pressed=true]{background:var(--accent);color:#000;font-weight:600}
 #res{margin-left:auto;color:var(--dim);font-variant-numeric:tabular-nums}
 main{display:grid;grid-template-columns:minmax(0,1fr) 470px;gap:16px;max-width:1500px;margin:auto;padding:16px}
 @media (max-width:980px){main{grid-template-columns:minmax(0,1fr)}}
@@ -35,13 +43,29 @@ button{font:inherit;padding:6px 12px;border:0;border-radius:4px;background:#238a
 button.del{background:#8f2d2d}
 input[type=number]{width:5em;font:inherit;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:4px}
 a{color:var(--accent)}
-#msg{font-weight:600}
+#msg,#isp-msg{font-weight:600}
+input[type=range]{width:100%;margin:0;accent-color:var(--accent)}
+.sl{display:grid;grid-template-columns:10.5em minmax(0,1fr) 3.8em;gap:8px;align-items:center;margin:3px 0}
+.sl input[type=checkbox]{justify-self:start;margin:0;accent-color:var(--accent)}
+.sl span{color:var(--dim);font-size:13px}
+.sl.chg span{color:var(--text)}
+.sl b{text-align:right;font-variant-numeric:tabular-nums}
+.meter{pointer-events:none;accent-color:var(--known)}
+.hint{color:var(--dim);font-size:12px;margin:6px 0 0}
+button.sec{background:#2a313c}
+textarea{width:100%;height:18em;margin-top:8px;background:var(--bg);color:var(--text);border:1px solid var(--line);
+  border-radius:4px;padding:6px;font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace}
 #foot{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums}
 </style>
 
 <header>
   <h1>Rostos ao vivo</h1>
+  <nav><a href="/" aria-current="page">Rostos</a><a href="/asr">Fala</a></nav>
   <span id="live">conectando…</span>
+  <div class="seg" role="group" aria-label="o que mostrar">
+    <button id="v-faces" aria-pressed="true" title="só a imagem de dentro de cada caixa (pouca banda)">Só os rostos</button>
+    <button id="v-full" aria-pressed="false" title="o quadro inteiro da câmera, com as caixas">Imagem inteira</button>
+  </div>
   <span id="res"></span>
 </header>
 
@@ -65,7 +89,7 @@ a{color:var(--accent)}
         <div class="card"><span>Detecção</span><b id="c-det">–</b><small id="s-det"></small></div>
         <div class="card"><span>Reconhecimento</span><b id="c-rec">–</b><small id="s-rec"></small></div>
         <div class="card"><span>Caixas recebidas</span><b id="c-box">–</b><small id="s-box"></small></div>
-        <div class="card"><span>Recortes</span><b id="c-crop">–</b><small id="s-crop"></small></div>
+        <div class="card"><span id="l-crop">Recortes</span><b id="c-crop">–</b><small id="s-crop"></small></div>
         <div class="card"><span>Rede</span><b id="c-net">–</b><small id="s-net"></small></div>
       </div>
     </section>
@@ -86,6 +110,34 @@ a{color:var(--accent)}
         <a href="/status" target="_blank">status (JSON)</a>
       </div>
     </section>
+    <section>
+      <h2>Microfone</h2>
+      <div class="sl"><span>nível</span>
+        <input id="mic" class="meter" type="range" min="-70" max="0" step="0.5" value="-70" tabindex="-1"
+          aria-readonly="true" aria-label="nível do microfone em dBFS"><b id="micv">–</b></div>
+      <div class="sl"><span>ganho do microfone</span>
+        <input id="mg" type="range" min="0" max="42" step="6" aria-label="ganho do microfone em dB"><b id="mgv">–</b></div>
+      <p class="hint" id="mic-hint">nível em dBFS (0 = o máximo do ADC); o pico fica segurado ~1 s.</p>
+    </section>
+    <section>
+      <h2>Imagem (ISP) <span id="isp-sensor"></span></h2>
+      <div id="isp-p"><p class="hint">carregando…</p></div>
+      <p class="hint" id="isp-ae" hidden></p>
+      <div class="row">
+        <button id="isp-save">Salvar na placa</button>
+        <button class="sec" id="isp-reset">Voltar ao padrão</button>
+        <button class="sec" id="isp-export">JSON para o cfg/</button>
+        <span id="isp-msg"></span>
+      </div>
+      <p class="hint">Muda na hora, só nesta placa. "Salvar" grava na NVS e volta no boot. Para virar o padrão do
+        firmware, cole o JSON em <code>cfg/ov5647_noaf.json</code> (o brilho do AE e a exposição pelo rosto não
+        vão no JSON: são do sensor e do firmware).
+        Use a imagem inteira para ver o efeito.</p>
+      <div id="isp-out" hidden>
+        <textarea id="isp-json" readonly spellcheck="false" aria-label="JSON de tuning"></textarea>
+        <div class="row"><button class="sec" id="isp-copy">Copiar</button></div>
+      </div>
+    </section>
   </div>
 </main>
 
@@ -94,11 +146,20 @@ const $ = id => document.getElementById(id);
 const cv = $('cv'), g = cv.getContext('2d'), q = $('q'), msg = $('msg');
 const KNOWN = '#3ddc84', UNKNOWN = '#ff9f1a';
 const STALE_MS = 700;           /* sem evento "faces" há mais que isso: caixas apagadas */
+const VIEW_KEY = 'face_app.view';
 
 let W = cv.width, H = cv.height;
 let faces = [], frameT = 0, facesAt = 0, dirty = true, live = false;
 const crops = new Map();        /* trk -> {img, x, y, w, h, cx, cy} */
+let frame = null;               /* imagem inteira: {img, f} - o último quadro (ImageBitmap) e as caixas dele */
+let frameGen = 0, framesGot = 0, frameBytes = 0;
 let boxEvents = 0, prev = null;
+let es = null, retry = 0;
+
+/* "faces": só a imagem de dentro de cada caixa (eventos "crop", pouca banda);
+ * "full": o quadro inteiro, pedido um a um ao /frame.jpg. Cada aba escolhe a sua. */
+let view = 'faces';
+try { if (localStorage.getItem(VIEW_KEY) === 'full') view = 'full'; } catch (e) {}
 
 function setLive(on) {
   live = on;
@@ -109,72 +170,142 @@ function setLive(on) {
 }
 
 function connect() {
-  const es = new EventSource('/events');
-  es.onopen = () => setLive(true);
-  es.onerror = () => {
+  clearTimeout(retry);
+  if (es) es.close();
+  const me = es = new EventSource(view === 'full' ? '/events?view=full' : '/events');
+  me.onopen = () => setLive(true);
+  me.onerror = () => {
+    if (me !== es) return;
     setLive(false);
     /* Recusado (ex.: limite de espectadores): o navegador desiste; tenta de novo. */
-    if (es.readyState === EventSource.CLOSED) setTimeout(connect, 2000);
+    if (me.readyState === EventSource.CLOSED) retry = setTimeout(connect, 2000);
   };
-  es.addEventListener('faces', e => {
+  me.addEventListener('faces', e => {
     const m = JSON.parse(e.data);
     faces = m.f; frameT = m.t; facesAt = performance.now();
     boxEvents++; dirty = true;
     for (const k of crops.keys()) if (!faces.some(f => f.trk === k)) crops.delete(k);
   });
-  es.addEventListener('crop', e => {
+  me.addEventListener('crop', e => {
     const m = JSON.parse(e.data), img = new Image();
     img.onload = () => {
-      if (!faces.some(f => f.trk === m.trk)) return;
+      if (view !== 'faces' || !faces.some(f => f.trk === m.trk)) return;
       m.img = img; delete m.jpg; crops.set(m.trk, m); dirty = true;
     };
     img.src = 'data:image/jpeg;base64,' + m.jpg;
   });
-  es.addEventListener('stats', e => stats(JSON.parse(e.data)));
+  me.addEventListener('stats', e => stats(JSON.parse(e.data)));
+  me.addEventListener('level', e => level(JSON.parse(e.data)));
+}
+
+const sleep = ms => new Promise(ok => setTimeout(ok, ms));
+
+function setFrame(next) {
+  if (frame) frame.img.close();
+  frame = next; dirty = true;
+}
+
+/* Imagem inteira: um quadro por pedido, e o próximo só depois que este chegou.
+ * Nunca há mais de um quadro na rede, então a imagem não acumula atraso; o
+ * ritmo é o que a rede aguenta. A decodificação (createImageBitmap) é fora da
+ * thread da página. Aba escondida não pede nada. */
+async function pullFrames(gen) {
+  let after = 0;
+  while (gen === frameGen) {
+    if (document.hidden) { await sleep(250); continue; }
+    try {
+      const r = await fetch('/frame.jpg?after=' + after, { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const f = JSON.parse(r.headers.get('X-Faces') || '[]');
+      after = +r.headers.get('X-Frame-Seq');
+      const blob = await r.blob();
+      const img = await createImageBitmap(blob);
+      if (gen !== frameGen) { img.close(); return; }
+      setFrame({ img, f });
+      framesGot++; frameBytes = blob.size;
+    } catch (e) {
+      if (gen === frameGen) setFrame(null);
+      await sleep(1000);
+    }
+  }
+}
+
+function startFrames() {
+  frameGen++;
+  setFrame(null);
+  if (view === 'full') pullFrames(frameGen);
+}
+
+function showView() {
+  $('v-faces').setAttribute('aria-pressed', view === 'faces');
+  $('v-full').setAttribute('aria-pressed', view === 'full');
+  $('l-crop').textContent = view === 'full' ? 'Imagem inteira' : 'Recortes';
+  cv.setAttribute('aria-label', view === 'full' ? 'imagem da câmera com as caixas dos rostos' : 'caixas dos rostos detectados');
+}
+
+/* Troca de modo = reconecta o /events (com ou sem recortes) e liga ou
+ * desliga os pedidos de quadro inteiro. */
+function setView(v) {
+  if (v === view) return;
+  view = v;
+  try { localStorage.setItem(VIEW_KEY, v); } catch (e) {}
+  crops.clear(); dirty = true;
+  showView();
+  connect();
+  startFrames();
 }
 
 /* ---- canvas: coordenadas do próprio quadro da câmera ---- */
+function drawBox(f, font, lw, withCrop) {
+  const x0 = f.x - f.dx / 2, y0 = f.y - f.dy / 2, color = f.id >= 0 ? KNOWN : UNKNOWN;
+  /* Recorte: chega mais devagar que a caixa; vai junto com ela, só dentro dela. */
+  const c = withCrop && crops.get(f.trk);
+  if (c) {
+    g.save(); g.beginPath(); g.rect(x0, y0, f.dx, f.dy); g.clip();
+    g.drawImage(c.img, c.x + f.x - c.cx, c.y + f.y - c.cy, c.w, c.h);
+    g.restore();
+  }
+  g.strokeStyle = color; g.lineWidth = lw; g.strokeRect(x0, y0, f.dx, f.dy);
+  g.beginPath(); g.moveTo(f.x - 12, f.y); g.lineTo(f.x + 12, f.y); g.moveTo(f.x, f.y - 12); g.lineTo(f.x, f.y + 12); g.stroke();
+
+  const label = f.id >= 0 ? `ID ${f.id} · ${f.sim}%` : 'desconhecido';
+  g.font = `600 ${font}px system-ui,sans-serif`;
+  const pad = font / 3, lh = font + 2 * pad, tw = g.measureText(label).width + 2 * pad;
+  const ly = y0 - lh >= 0 ? y0 - lh : y0;
+  g.fillStyle = color; g.fillRect(x0, ly, tw, lh);
+  g.fillStyle = '#000'; g.textBaseline = 'top'; g.fillText(label, x0 + pad, ly + pad);
+}
+
 function draw() {
   requestAnimationFrame(draw);
   if (!dirty) return;
   dirty = false;
   const stale = performance.now() - facesAt > STALE_MS;
   const shown = stale ? [] : faces;
-
-  g.fillStyle = '#05070a'; g.fillRect(0, 0, W, H);
-  g.strokeStyle = 'rgba(255,255,255,.06)'; g.lineWidth = 1;
-  g.beginPath();
-  for (let i = 1; i < 8; i++) { g.moveTo(W * i / 8, 0); g.lineTo(W * i / 8, H); g.moveTo(0, H * i / 8); g.lineTo(W, H * i / 8); }
-  g.stroke();
-  g.strokeStyle = 'rgba(255,255,255,.18)';
-  g.beginPath(); g.moveTo(W / 2 - 20, H / 2); g.lineTo(W / 2 + 20, H / 2); g.moveTo(W / 2, H / 2 - 20); g.lineTo(W / 2, H / 2 + 20); g.stroke();
-
   const font = Math.round(H / 32), lw = Math.max(2, Math.round(W / 320));
-  for (const f of shown) {
-    const x0 = f.x - f.dx / 2, y0 = f.y - f.dy / 2, color = f.id >= 0 ? KNOWN : UNKNOWN;
-    /* Recorte: chega mais devagar que a caixa; vai junto com ela, só dentro dela. */
-    const c = crops.get(f.trk);
-    if (c) {
-      g.save(); g.beginPath(); g.rect(x0, y0, f.dx, f.dy); g.clip();
-      g.drawImage(c.img, c.x + f.x - c.cx, c.y + f.y - c.cy, c.w, c.h);
-      g.restore();
+
+  if (view === 'full' && frame) {
+    /* O quadro e as caixas dele: chegam juntos, então a caixa fica no rosto
+     * mesmo quando a imagem atrasa em relação à tabela. */
+    g.drawImage(frame.img, 0, 0, W, H);
+    for (const f of frame.f) drawBox(f, font, lw, false);
+  } else {
+    g.fillStyle = '#05070a'; g.fillRect(0, 0, W, H);
+    g.strokeStyle = 'rgba(255,255,255,.06)'; g.lineWidth = 1;
+    g.beginPath();
+    for (let i = 1; i < 8; i++) { g.moveTo(W * i / 8, 0); g.lineTo(W * i / 8, H); g.moveTo(0, H * i / 8); g.lineTo(W, H * i / 8); }
+    g.stroke();
+    g.strokeStyle = 'rgba(255,255,255,.18)';
+    g.beginPath(); g.moveTo(W / 2 - 20, H / 2); g.lineTo(W / 2 + 20, H / 2); g.moveTo(W / 2, H / 2 - 20); g.lineTo(W / 2, H / 2 + 20); g.stroke();
+
+    if (view === 'faces') for (const f of shown) drawBox(f, font, lw, true);
+    if (view === 'full' || !shown.length) {
+      g.fillStyle = 'rgba(255,255,255,.3)'; g.font = `${font}px system-ui,sans-serif`;
+      g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.fillText(!live ? 'sem conexão com a placa' : view === 'full' ? 'aguardando a imagem…' : 'nenhum rosto',
+        W / 2, H / 2 + font * 1.5);
+      g.textAlign = 'start';
     }
-    g.strokeStyle = color; g.lineWidth = lw; g.strokeRect(x0, y0, f.dx, f.dy);
-    g.beginPath(); g.moveTo(f.x - 12, f.y); g.lineTo(f.x + 12, f.y); g.moveTo(f.x, f.y - 12); g.lineTo(f.x, f.y + 12); g.stroke();
-
-    const label = f.id >= 0 ? `ID ${f.id} · ${f.sim}%` : 'desconhecido';
-    g.font = `600 ${font}px system-ui,sans-serif`;
-    const pad = font / 3, lh = font + 2 * pad, tw = g.measureText(label).width + 2 * pad;
-    const ly = y0 - lh >= 0 ? y0 - lh : y0;
-    g.fillStyle = color; g.fillRect(x0, ly, tw, lh);
-    g.fillStyle = '#000'; g.textBaseline = 'top'; g.fillText(label, x0 + pad, ly + pad);
-  }
-
-  if (!shown.length) {
-    g.fillStyle = 'rgba(255,255,255,.3)'; g.font = `${font}px system-ui,sans-serif`;
-    g.textAlign = 'center'; g.textBaseline = 'middle';
-    g.fillText(live ? 'nenhum rosto' : 'sem conexão com a placa', W / 2, H / 2 + font * 1.5);
-    g.textAlign = 'start';
   }
   table(shown);
 }
@@ -193,8 +324,14 @@ function card(id, value, sub) { $('c-' + id).textContent = value; $('s-' + id).t
 function stats(s) {
   if (s.width !== W || s.height !== H) { W = cv.width = s.width; H = cv.height = s.height; dirty = true; }
   $('res').textContent = `${s.width}×${s.height}`;
+  aeStatus(s.ae);
   $('ids').textContent = s.enrolled.length ? s.enrolled.join(', ') : 'nenhum';
-  if (!prev) { q.value = s.quality; $('qv').textContent = s.quality; }
+  if (!prev) {
+    q.value = s.quality; $('qv').textContent = s.quality;
+    mg.disabled = s.mic_gain < 0;
+    if (s.mic_gain >= 0) { mg.value = s.mic_gain; $('mgv').textContent = s.mic_gain + ' dB'; }
+    else $('mic-hint').textContent = 'o microfone (ES8311) não iniciou - veja o log serial.';
+  }
   const dt = prev ? (s.uptime_ms - prev.uptime_ms) / 1000 : 0;
   if (dt > 0) {
     const rate = k => (s[k] - prev[k]) / dt;
@@ -203,10 +340,12 @@ function stats(s) {
     if (s.recogs) card('rec', (s.recog_us / 1000).toFixed(0) + ' ms', `${rate('recogs').toFixed(1)}/s · ${s.recogs} no total`);
     else card('rec', '—', 'nenhum ainda');
     card('box', (boxEvents / dt).toFixed(1) + '/s', 'uma por quadro analisado com rosto');
-    card('crop', rate('crop_sets').toFixed(1) + '/s', `${(s.crop_bytes / 1024).toFixed(1)} KB · ${(s.crop_us / 1000).toFixed(1)} ms para fazer`);
-    card('net', (rate('bytes_sent') * 8 / 1e6).toFixed(2) + ' Mbit/s', `${s.viewers} assistindo`);
+    if (view === 'full') card('crop', (framesGot / dt).toFixed(1) + '/s', `${(frameBytes / 1024).toFixed(0)} KB · ${(s.frame_us / 1000).toFixed(1)} ms para fazer`);
+    else card('crop', rate('crop_sets').toFixed(1) + '/s', `${(s.crop_bytes / 1024).toFixed(1)} KB · ${(s.crop_us / 1000).toFixed(1)} ms para fazer`);
+    card('net', (rate('bytes_sent') * 8 / 1e6).toFixed(2) + ' Mbit/s',
+      `${s.viewers} assistindo` + (s.viewers_full ? ` (${s.viewers_full} na imagem inteira)` : ''));
   }
-  boxEvents = 0;
+  boxEvents = 0; framesGot = 0;
   $('foot').textContent = `ligada há ${(s.uptime_ms / 1000).toFixed(0)} s · memória livre ${(s.heap_internal / 1024).toFixed(0)} KB interna, ` +
     `${(s.heap_psram / 1048576).toFixed(1)} MB PSRAM` + (s.encode_failed ? ` · ${s.encode_failed} JPEG falharam` : '');
   prev = s;
@@ -232,7 +371,165 @@ $('clr').onclick = async () => {
   const j = await post('/delete?id=all'); msg.textContent = j.ok ? 'todos apagados' : j.error;
 };
 
+$('v-faces').onclick = () => setView('faces');
+$('v-full').onclick = () => setView('full');
+
+/* ---- microfone: o slider segue o nível (sobe na hora, desce suave) ---- */
+const mic = $('mic'), mg = $('mg');
+let micShown = -70;
+function level(m) {
+  micShown = m.rms > micShown ? m.rms : micShown + (m.rms - micShown) * 0.35;
+  mic.value = micShown;
+  $('micv').textContent = m.rms.toFixed(0);
+  mic.title = `agora ${m.rms.toFixed(1)} dB · pico ${m.peak.toFixed(1)} dB`;
+}
+mg.oninput = () => $('mgv').textContent = mg.value + ' dB';
+mg.onchange = async () => {
+  const r = await fetch('/audio?gain=' + mg.value, { method: 'POST' });
+  const j = await r.json().catch(() => ({}));
+  if (j.ok) { mg.value = j.gain; $('mgv').textContent = j.gain + ' dB'; }
+};
+
+/* ---- ajuste do ISP: os parâmetros e as faixas vêm da placa (/isp) ---- */
+const ISP_LABEL = {
+  ae: ['Brilho (alvo do AE)', 'o AE do sensor ajusta exposição e ganho até o brilho médio chegar aqui; mais = mais claro e mais ruído. ' +
+    'Com a exposição pelo rosto ligada, vale só sem rosto na imagem'],
+  face: ['Exposição pelo rosto', 'com rosto na imagem, o alvo do AE é ajustado até o rosto ficar com o brilho abaixo - resolve o contraluz'],
+  face_luma: ['Brilho do rosto', 'brilho do miolo do rosto que a exposição pelo rosto busca (0-255, como sai na imagem)'],
+  gamma: ['Gamma', 'menor = sombras mais claras; maior = mais contraste nos escuros'],
+  contrast: ['Contraste', ''],
+  saturation: ['Saturação', 'menos = cores mais fracas e menos ruído colorido'],
+  ccm: ['Força da cor (CCM)', '0 = sem correção de cor; a matriz do firmware é forte e dobra o ruído do vermelho e do azul'],
+  red: ['Vermelho', 'ganho do vermelho antes da matriz: tira tom ciano/vermelho'],
+  blue: ['Azul', 'ganho do azul antes da matriz: tira tom amarelo/azul'],
+  denoise: ['Redução de ruído', 'filtro no RAW: mais = imagem mais limpa, mas alto demais borra o rosto'],
+  sharp_m: ['Nitidez', 'reforço das bordas médias'],
+  sharp_h: ['Nitidez (bordas fortes)', 'reforço das bordas mais marcadas'],
+  sharp_l: ['Limiar da nitidez', 'detalhe abaixo disto é tratado como ruído e não é reforçado'],
+};
+let isp = null, ispBusy = false, ispTimer = 0;
+const ispPending = {};
+const ispMsg = t => { $('isp-msg').textContent = t; };
+const fmt = (v, step) => step < 1 ? (+v).toFixed(step < 0.1 ? 2 : 1) : String(Math.round(v));
+const ISP_SWITCH = new Set(['face']);       /* liga/desliga: caixa em vez de slider */
+const ispShown = (el, step) => el.type === 'checkbox' ? (el.checked ? 'sim' : 'não') : fmt(el.value, step);
+
+/* Estado ao vivo da exposição (vem no "stats", 1 por segundo). */
+const AE_MODE = {
+  off: 'exposição pelo rosto desligada', idle: 'sem rosto: vale o brilho do slider', face: 'seguindo o rosto',
+  hold: 'o rosto sumiu: segurando o ajuste', back: 'voltando ao brilho do slider',
+};
+function aeStatus(a) {
+  const t = $('isp-ae');
+  t.hidden = !a || a.now < 0;
+  if (t.hidden) return;
+  t.textContent = `alvo do AE no sensor: ${a.now} · ` +
+    (a.luma >= 0 ? `brilho do rosto ${a.luma} (alvo ${a.target}) · ` : '') + (AE_MODE[a.mode] || a.mode);
+}
+
+function ispRender(s) {
+  isp = s;
+  $('isp-sensor').textContent = s.sensor ? '· ' + s.sensor : '';
+  const box = $('isp-p');
+  if (!s.p.length) {
+    box.innerHTML = '<p class="hint">ajuste indisponível: sem câmera, ou sem tuning de IPA para este sensor.</p>';
+    for (const id of ['isp-save', 'isp-reset', 'isp-export']) $(id).disabled = true;
+    return;
+  }
+  if (!box.querySelector('input')) {
+    box.innerHTML = s.p.map(p => {
+      const [label, tip] = ISP_LABEL[p.k] || [p.k, ''];
+      const input = ISP_SWITCH.has(p.k) ? `<input type="checkbox" data-k="${p.k}">`
+        : `<input type="range" min="${p.min}" max="${p.max}" step="${p.step}" data-k="${p.k}">`;
+      return `<label class="sl" id="isp-${p.k}" title="${tip}"><span>${label}</span>${input}<b></b></label>`;
+    }).join('');
+    for (const el of box.querySelectorAll('input')) {
+      const sw = el.type === 'checkbox';
+      el[sw ? 'onchange' : 'oninput'] = () => {
+        el.nextElementSibling.textContent = ispShown(el, +el.step);
+        ispQueue(el.dataset.k, sw ? +el.checked : el.value);
+      };
+    }
+  }
+  for (const p of s.p) {
+    const row = $('isp-' + p.k), el = row.querySelector('input');
+    if (!(p.k in ispPending) && document.activeElement !== el) {
+      if (el.type === 'checkbox') el.checked = !!p.v; else el.value = p.v;
+    }
+    row.querySelector('b').textContent = ispShown(el, p.step);
+    row.classList.toggle('chg', Math.abs(p.v - p.def) > p.step / 2);
+  }
+  ispMsg(s.saved ? 'salvo na placa' : s.p.some(p => Math.abs(p.v - p.def) > p.step / 2) ? 'não salvo' : '');
+  if (!$('isp-out').hidden) $('isp-json').value = ispExport(s);
+}
+
+/* Junta as mudanças e manda uma requisição por vez: arrastar o slider não
+ * enfileira dezenas de reconfigurações do ISP. */
+function ispQueue(k, v) {
+  ispPending[k] = v;
+  if (!ispTimer) ispTimer = setTimeout(ispFlush, 120);
+}
+async function ispFlush() {
+  ispTimer = 0;
+  if (ispBusy) { ispTimer = setTimeout(ispFlush, 60); return; }
+  const qs = Object.entries(ispPending).map(([k, v]) => k + '=' + v).join('&');
+  for (const k in ispPending) delete ispPending[k];
+  if (qs) await ispPost(qs);
+}
+async function ispPost(qs) {
+  ispBusy = true;
+  try {
+    const r = await fetch('/isp?' + qs, { method: 'POST' });
+    const j = await r.json();
+    if (r.ok) ispRender(j); else ispMsg(j.error || 'HTTP ' + r.status);
+  } catch (e) { ispMsg('sem resposta da placa'); }
+  ispBusy = false;
+}
+async function ispLoad() {
+  try {
+    const r = await fetch('/isp', { cache: 'no-store' });
+    ispRender(await r.json());
+  } catch (e) { setTimeout(ispLoad, 3000); }
+}
+
+/* O JSON no formato do cfg/ (seções adn, aen, ian e acc). Para a OV5647 é o
+ * arquivo inteiro; numa IMX708 faltariam as seções agc/awb dela. */
+function ispExport(s) {
+  const v = Object.fromEntries(s.p.map(p => [p.k, p.v])), x = s.x, o = {};
+  if (x.bf) o.adn = { bf: [{ gain: 1, param: { level: v.denoise, matrix: x.bf.m } }] };
+  const aen = {};
+  if (x.gamma) aen.gamma = { use_gamma_param: true, luma_env: x.gamma.env, luma_min_step: x.gamma.step,
+    table: [{ luma: x.gamma.luma, gamma_param: v.gamma }] };
+  if (x.sharpen) aen.sharpen = [{ gain: 1, param: { h_thresh: x.sharpen.ht, l_thresh: Math.min(v.sharp_l, x.sharpen.ht),
+    h_coeff: v.sharp_h, m_coeff: v.sharp_m, matrix: x.sharpen.m } }];
+  if ('contrast' in v) aen.contrast = [{ gain: 1, value: v.contrast }];
+  if (Object.keys(aen).length) o.aen = aen;
+  if (x.ae_w) o.ian = { luma: { ae: { weight: x.ae_w } } };
+  const acc = {};
+  if ('saturation' in v) acc.saturation = [{ color_temp: 0, value: v.saturation }];
+  if (x.ccm) acc.ccm = { low_luma: { luma_env: x.ccm.env, threshold: x.ccm.thr, matrix: x.ccm.low },
+    table: x.ccm.t.map(e => ({ color_temp: e.ct, matrix: e.m })) };
+  if (Object.keys(acc).length) o.acc = acc;
+  return JSON.stringify({ version: 1, [s.sensor]: o }, null, 4) + '\n';
+}
+
+$('isp-save').onclick = () => ispPost('save');
+$('isp-reset').onclick = () => { if (confirm('Voltar ao tuning do firmware e apagar o ajuste salvo?')) ispPost('reset'); };
+$('isp-export').onclick = () => {
+  const out = $('isp-out');
+  out.hidden = !out.hidden;
+  if (!out.hidden && isp) $('isp-json').value = ispExport(isp);
+};
+$('isp-copy').onclick = async () => {
+  const t = $('isp-json');
+  try { await navigator.clipboard.writeText(t.value); ispMsg('JSON copiado'); }
+  catch (e) { t.select(); ispMsg('selecionado: Ctrl+C'); }
+};
+ispLoad();
+
 setInterval(() => { dirty = true; }, 250);   /* apaga caixas paradas e mantém a tabela em dia */
+showView();
 connect();
+startFrames();
 draw();
 </script>

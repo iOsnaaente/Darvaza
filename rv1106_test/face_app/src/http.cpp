@@ -4,6 +4,7 @@
 #include "http.h"
 
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -22,7 +23,7 @@ static const char *TAG = "http";
 
 #define MAX_CONNECTIONS   16
 #define MAX_HEADER        8192
-#define MAX_BODY          65536
+#define MAX_BODY          (4 * 1024 * 1024)  /* gravação da página /asr: 2 min de 16 kHz mono */
 #define RECV_TIMEOUT_S    5
 
 static std::map<std::string, HttpHandler> s_routes;   /* "GET /status" -> handler */
@@ -49,14 +50,19 @@ bool http_send_all(int fd, const char *data, size_t len)
     return true;
 }
 
-bool http_respond(int fd, const char *status, const char *type, const std::string &body)
+bool http_respond(int fd, const char *status, const char *type, const void *body, size_t len, const char *extra)
 {
     std::string head;
     appendf(head,
             "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %u\r\nCache-Control: no-store\r\n"
-            "Connection: close\r\n\r\n",
-            status, type, (unsigned)body.size());
-    return http_send_all(fd, head.data(), head.size()) && http_send_all(fd, body.data(), body.size());
+            "%sConnection: close\r\n\r\n",
+            status, type, (unsigned)len, extra);
+    return http_send_all(fd, head.data(), head.size()) && http_send_all(fd, (const char *)body, len);
+}
+
+bool http_respond(int fd, const char *status, const char *type, const std::string &body)
+{
+    return http_respond(fd, status, type, body.data(), body.size(), "");
 }
 
 bool http_query_value(const std::string &query, const char *key, std::string &out)
@@ -77,6 +83,23 @@ bool http_query_value(const std::string &query, const char *key, std::string &ou
     return false;
 }
 
+std::string http_url_decode(const std::string &s)
+{
+    std::string out;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '+') {
+            out += ' ';
+        } else if (s[i] == '%' && i + 2 < s.size() && isxdigit((unsigned char)s[i + 1]) &&
+                   isxdigit((unsigned char)s[i + 2])) {
+            out += (char)strtol(s.substr(i + 1, 2).c_str(), nullptr, 16);
+            i += 2;
+        } else {
+            out += s[i];
+        }
+    }
+    return out;
+}
+
 static void serve(int fd)
 {
     timeval tv = {RECV_TIMEOUT_S, 0};
@@ -93,21 +116,27 @@ static void serve(int fd)
         req.append(buf, n);
     }
 
-    /* Corpo (se houver) lido e descartado: fechar com dados não lidos faz o
+    /* Corpo lido inteiro antes de responder: fechar com dados não lidos faz o
      * kernel mandar RST, e o cliente pode perder a resposta. */
-    size_t body = req.size() - (head_end + 4);
-    const char *cl = strcasestr(req.c_str(), "\r\nContent-Length:");
-    size_t want = cl ? strtoul(cl + 17, nullptr, 10) : 0;
-    while (body < want && body < MAX_BODY) {
-        ssize_t n = recv(fd, buf, sizeof(buf), 0);
-        if (n <= 0) {
-            break;
-        }
-        body += n;
-    }
-
     HttpRequest r;
     r.fd = fd;
+    const char *cl = strcasestr(req.c_str(), "\r\nContent-Length:");
+    size_t want = cl && (size_t)(cl - req.c_str()) < head_end ? strtoul(cl + 17, nullptr, 10) : 0;
+    if (want > MAX_BODY) {
+        http_respond(fd, "413 Payload Too Large", "text/plain", "corpo grande demais\n");
+        return;
+    }
+    r.body = req.substr(head_end + 4);
+    while (r.body.size() < want) {
+        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        if (n <= 0) {
+            http_respond(fd, "400 Bad Request", "text/plain", "corpo incompleto\n");
+            return;
+        }
+        r.body.append(buf, n);
+    }
+    r.body.resize(want);
+
     size_t sp1 = req.find(' '), sp2 = req.find(' ', sp1 + 1);
     if (sp1 == std::string::npos || sp2 == std::string::npos || sp2 > head_end) {
         http_respond(fd, "400 Bad Request", "text/plain", "requisicao invalida\n");

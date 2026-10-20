@@ -36,6 +36,8 @@ typedef struct {
 typedef struct {
     uint32_t seq;             /* muda a cada quadro analisado */
     int64_t frame_us;         /* captura do quadro analisado (esp_timer) */
+    int16_t luma;             /* brilho (0-255, como sai na imagem) do miolo do maior
+                               * rosto detectado neste quadro; -1 = nenhum */
     size_t n;
     face_box_t box[FACE_MAX_BOXES];
 } face_result_t;
@@ -77,7 +79,11 @@ esp_err_t face_init(int width, int height, face_release_fn release);
  * ocupada devolve false e o buffer continua com quem chamou. */
 bool face_offer_frame(uint8_t *rgb565, int buf_index);
 
-/* Último resultado publicado; sem caixas (n = 0) se tiver mais que max_age_ms. */
+/* Pausa a IA (face_offer_frame passa a recusar todo quadro) e retoma. */
+void face_pause(bool paused);
+bool face_paused(void);
+
+/* Último resultado publicado; sem caixas (n = 0, luma = -1) se tiver mais que max_age_ms. */
 void face_get_result(face_result_t *out, uint32_t max_age_ms);
 
 /* Cadastra o maior rosto do próximo quadro com rosto. Bloqueia até timeout_ms. */

@@ -11,6 +11,7 @@
 
 #include <opencv2/imgproc.hpp>
 
+#include "im2d.hpp"
 #include "rk_aiq_user_api2_ae.h"
 #include "rk_aiq_user_api2_imgproc.h"
 #include "rk_aiq_user_api2_sysctl.h"
@@ -26,9 +27,10 @@ static const char *TAG = "camera";
 #define VI_DEV          0
 #define VI_PIPE         0
 #define VI_CHN          0
-/* Até 3 quadros ficam com o app ao mesmo tempo (IA, fila dos recortes,
- * captura) e o ISP precisa de 2 livres para não perder quadro. */
-#define VI_BUF_COUNT    5
+/* Até 4 quadros ficam com o app ao mesmo tempo (IA, fila dos recortes,
+ * captura, imagem inteira até o RGA copiá-lo) e o ISP precisa de 2 livres
+ * para não perder quadro. */
+#define VI_BUF_COUNT    6
 #define VI_DEPTH        2       /* quadros prontos esperando o GetChnFrame */
 #define IQ_DIR          "/etc/iqfiles"
 
@@ -188,4 +190,42 @@ cv::Mat frame_to_bgr(const Frame &f, const cv::Rect &r, cv::Size out)
         return small;
     }
     return bgr;
+}
+
+cv::Mat frame_to_bgr_full(const Frame &f)
+{
+    /* Linha múltipla de 16 pixels, como o RGA prefere. */
+    static MB_BLK s_blk = MB_INVALID_HANDLE;
+    static int s_bw, s_bh, s_bstride;
+    static bool s_failed;
+
+    const int stride = (f.w + 15) & ~15;
+    if (!s_failed && (s_blk == MB_INVALID_HANDLE || s_bw != f.w || s_bh != f.h)) {
+        if (s_blk != MB_INVALID_HANDLE) {
+            RK_MPI_SYS_MmzFree(s_blk);
+            s_blk = MB_INVALID_HANDLE;
+        }
+        if (RK_MPI_SYS_MmzAlloc_Cached(&s_blk, RK_NULL, RK_NULL, (RK_U32)stride * f.h * 3) != RK_SUCCESS) {
+            LOGW(TAG, "sem memória DMA para o quadro inteiro: conversão pela CPU");
+            s_blk = MB_INVALID_HANDLE;
+            s_failed = true;
+        }
+        s_bw = f.w;
+        s_bh = f.h;
+        s_bstride = stride;
+    }
+
+    if (!s_failed) {
+        rga_buffer_t src = wrapbuffer_fd(f.fd, f.w, f.h, RK_FORMAT_YCbCr_420_SP, f.stride, f.vstride);
+        rga_buffer_t dst = wrapbuffer_fd(RK_MPI_MB_Handle2Fd(s_blk), f.w, f.h, RK_FORMAT_BGR_888, s_bstride, f.h);
+        IM_STATUS st = imcvtcolor(src, dst, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_BGR_888);
+        if (st == IM_STATUS_SUCCESS) {
+            /* O RGA escreveu por DMA: descarta o que a CPU tinha em cache. */
+            RK_MPI_SYS_MmzFlushCache(s_blk, RK_TRUE);
+            return cv::Mat(f.h, f.w, CV_8UC3, RK_MPI_MB_Handle2VirAddr(s_blk), (size_t)s_bstride * 3);
+        }
+        LOGW(TAG, "RGA falhou no quadro inteiro (%s): conversão pela CPU", imStrError(st));
+        s_failed = true;
+    }
+    return frame_to_bgr(f, cv::Rect(0, 0, f.w & ~1, f.h & ~1));
 }

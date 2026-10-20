@@ -1,7 +1,14 @@
 # 16 MB de flash. O app leva câmera + esp_ipa + Wi-Fi + esp_hosted + os
 # modelos de rosto no rodata; "storage" é a FAT com os cadastros (faces.bin).
+# "model" recebe o srmodels.bin do esp-sr (~3,5 MB: WakeNet10 "Olá ESP",
+# MultiNet7 inglês e VADNet; o idf.py flash grava). Precisa estar alinhada em
+# 64 KB: o esp-sr lê os pesos pelo mmap da flash. "clips" é a FAT das frases
+# da página de fala (~90 s de áudio a 16 kHz). As três primeiras não mudaram
+# de lugar: os cadastros de rosto continuam onde estavam.
 # Name,   Type, SubType, Offset,   Size
 nvs,      data, nvs,     0x9000,   0x6000
 phy_init, data, phy,     0xf000,   0x1000
 factory,  app,  factory, 0x10000,  8M
 storage,  data, fat,     0x810000, 1M
+model,    data, spiffs,  0x910000, 4M
+clips,    data, fat,     0xD10000, 0x2F0000

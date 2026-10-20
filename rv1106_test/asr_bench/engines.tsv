@@ -1,0 +1,18 @@
+# Motores que a página "Fala" oferece: nome<TAB>comando. O comando roda na
+# pasta do asr_bench (com exec: um comando simples; variável vai com env),
+# recebe os .wav no fim e imprime uma linha JSON por arquivo (formato em
+# src/bench.h). Dá para acrescentar variantes aqui na placa sem recompilar.
+#
+# As "-rapido"/"-ac" são o mesmo modelo com outro ajuste:
+#   vosk-small-pt-rapido  busca do decodificador dos modelos pequenos novos do
+#                         Vosk (max-active 3000, beam 10) em vez da fixa do
+#                         formato antigo (7000, 13); ver vosk-rapido.conf
+#   whisper-tiny-ac       janela do encoder do tamanho da fala em vez de 30 s
+#                         fixos (--ac auto em src/asr_whisper.cpp)
+#   vosk-comandos         só as frases de comandos.json (gramática): para um
+#                         robô que obedece a uma lista fechada de comandos
+vosk-small-pt	bin/vosk.sh -m models/vosk-model-small-pt-0.3
+vosk-small-pt-rapido	bin/vosk.sh -m models/vosk-model-small-pt-0.3-rapido
+vosk-comandos	bin/vosk.sh -m models/vosk-model-small-pt-0.3-rapido -g comandos.json
+whisper-tiny	bin/asr_whisper -m models/ggml-tiny-q8_0.bin -l pt
+whisper-tiny-ac	bin/asr_whisper -m models/ggml-tiny-q8_0.bin -l pt --ac auto

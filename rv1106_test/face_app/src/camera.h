@@ -44,3 +44,8 @@ cv::Rect frame_even_rect(const Frame &f, cv::Rect r);
 /* Região r do quadro (já passada por frame_even_rect) em BGR, reduzida para
  * out (vazio = mesmo tamanho; a redução pula pixels). */
 cv::Mat frame_to_bgr(const Frame &f, const cv::Rect &r, cv::Size out = cv::Size());
+
+/* O quadro inteiro em BGR pelo RGA, sem CPU. A imagem fica num buffer DMA
+ * reaproveitado: vale até a próxima chamada, que deve vir da mesma thread.
+ * Sem o RGA ou sem o buffer, converte pela CPU (frame_to_bgr). */
+cv::Mat frame_to_bgr_full(const Frame &f);

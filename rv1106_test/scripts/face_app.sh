@@ -8,7 +8,7 @@
 #   restart   stop + start
 #   monitor   segue o terminal do app: [ID,X,Y,dX,dY,time_detected], "#" e avisos
 #   run       roda em primeiro plano, com a saída inteira (Ctrl+C para)
-#   web       pelo adb: porta 80 da placa em http://localhost:8080/ (só na WSL)
+#   web       pelo adb: porta 80 da placa em http://127.0.0.1:8080/ (WSL e Windows)
 # Opções do app vão em FACE_APP_ARGS (ex.: FACE_APP_ARGS="--hz 50 --thr 0.55").
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
@@ -61,11 +61,14 @@ run)
     board "cd $APP_DIR && ./face_app $ARGS"
     ;;
 web)
+    # O adb escuta só em 127.0.0.1. Com a rede espelhada da WSL o navegador do
+    # Windows chega nele por 127.0.0.1, mas não por "localhost" (que o Windows
+    # tenta primeiro em IPv6, ::1, e a WSL não repassa).
     adb forward tcp:8080 tcp:80 >/dev/null
-    echo "abra http://localhost:8080/ (de dentro da WSL)"
+    echo "abra http://127.0.0.1:8080/ (no navegador do Windows ou da WSL)"
     ;;
 *)
-    sed -n '2,13p' "$0"
+    sed -n '2,12p' "$0"
     exit 1
     ;;
 esac

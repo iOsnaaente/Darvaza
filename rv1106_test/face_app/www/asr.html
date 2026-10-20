@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="pt-br">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fala na placa</title>
+<style>
+:root{--bg:#0e1116;--panel:#161b22;--line:#2a313c;--text:#e6e9ee;--dim:#8b95a3;
+  --known:#3ddc84;--unknown:#ff9f1a;--bad:#ff5c5c;--accent:#4aa3ff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,sans-serif}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line)}
+header h1{font-size:16px;margin:0;font-weight:600}
+nav{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+nav a{padding:4px 12px;color:var(--dim);text-decoration:none}
+nav a+a{border-left:1px solid var(--line)}
+nav a[aria-current=page]{background:var(--accent);color:#000;font-weight:600}
+#live{font-size:12px;padding:2px 10px;border-radius:999px;background:#3a1d1d;color:var(--bad)}
+#live.on{background:#173524;color:var(--known)}
+#live.busy{background:#3a2d12;color:var(--unknown)}
+#mem{margin-left:auto;color:var(--dim);font-variant-numeric:tabular-nums}
+main{display:grid;grid-template-columns:minmax(0,1fr) 430px;gap:16px;max-width:1500px;margin:auto;padding:16px}
+@media (max-width:980px){main{grid-template-columns:minmax(0,1fr)}}
+section{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:12px;margin-bottom:12px}
+h2{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 8px}
+table{width:100%;border-collapse:collapse;font:13px ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}
+th{font:600 11px system-ui,sans-serif;color:var(--dim);text-align:right;padding:4px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{text-align:right;padding:5px 4px;border-bottom:1px solid #1f252e;vertical-align:top;white-space:nowrap}
+th.l,td.l{text-align:left}
+td.txt{text-align:left;white-space:normal;font-family:system-ui,sans-serif}
+td.none{text-align:center;color:var(--dim);font-family:system-ui,sans-serif;padding:14px}
+.eng{color:var(--accent);font-weight:700}
+.err{color:var(--bad)}
+.dim{color:var(--dim)}
+.engines{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px}
+.ecard{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px 10px}
+.ecard h3{margin:0 0 6px;font-size:14px;color:var(--accent)}
+.ecard .big{display:flex;gap:16px;margin-bottom:6px}
+.ecard .big div span{display:block;font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
+.ecard .big div b{font-size:20px;font-variant-numeric:tabular-nums}
+.ecard dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:0;font-size:13px}
+.ecard dt{color:var(--dim)}
+.ecard dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
+.ok{color:var(--known)} .warn{color:var(--unknown)}
+.clip{border-top:1px solid var(--line);padding:10px 0}
+.clip:first-child{border-top:0;padding-top:0}
+.clip .ref{margin:4px 0 6px;color:var(--dim)}
+mark{background:#4a1f1f;color:#ffb3b3;border-radius:3px;padding:0 2px}
+mark.ins{background:#3a2d12;color:#ffd38a}
+del{color:var(--bad);opacity:.8}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+button{font:inherit;padding:6px 12px;border:0;border-radius:4px;background:#238a4f;color:#fff;cursor:pointer}
+button:disabled{opacity:.45;cursor:default}
+button.del{background:#8f2d2d}
+button.sec{background:#2a313c}
+button.play{padding:1px 8px;background:#2a313c;font-size:12px}
+#cliplist{max-height:330px;overflow:auto;border:1px solid var(--line);border-radius:4px}
+.ci{display:grid;grid-template-columns:auto 1fr auto;gap:2px 8px;padding:6px 8px;border-bottom:1px solid #1f252e;cursor:pointer}
+.ci:last-child{border-bottom:0}
+.ci small{grid-column:2/4;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ci .meta{display:flex;gap:6px;align-items:center;color:var(--dim);font-variant-numeric:tabular-nums}
+.bar{height:6px;background:var(--bg);border-radius:3px;overflow:hidden;margin-top:6px}
+.bar i{display:block;height:100%;background:var(--unknown);width:0}
+textarea{width:100%;font:inherit;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:6px}
+audio{width:100%;margin-top:6px}
+#rec.on{background:#c0392b}
+details summary{cursor:pointer;color:var(--dim)}
+.note{color:var(--dim);font-size:12px;margin:6px 0 0}
+.scroll{overflow-x:auto}
+</style>
+
+<header>
+  <h1>Fala na placa</h1>
+  <nav><a href="/">Rostos</a><a href="/asr" aria-current="page">Fala</a></nav>
+  <span id="live">conectando…</span>
+  <span id="mem"></span>
+</header>
+
+<main>
+  <div>
+    <section>
+      <h2>Resumo por motor</h2>
+      <div class="engines" id="summary"><p class="dim">nenhuma medição ainda</p></div>
+      <p class="note">Última medição de cada frase. RTF = tempo de processamento ÷ duração da fala (abaixo de 1 acompanha
+        em tempo real). WER = palavras erradas, faltando ou sobrando ÷ palavras da referência, sem maiúsculas,
+        pontuação e com números por extenso.</p>
+    </section>
+    <section>
+      <h2>Frase a frase</h2>
+      <div id="byclip"><p class="dim">nenhuma medição ainda</p></div>
+    </section>
+    <section>
+      <details>
+        <summary id="histsum">Todas as medições</summary>
+        <div class="scroll">
+          <table>
+            <thead><tr><th class="l">medição</th><th class="l">motor</th><th class="l">frase</th><th>fala</th><th>proc.</th>
+              <th>RTF</th><th>CPU</th><th>RAM</th><th>carga</th><th>WER</th><th class="l">IA rostos</th></tr></thead>
+            <tbody id="hist"></tbody>
+          </table>
+        </div>
+        <div class="row"><button class="del" id="clear">Apagar resultados</button></div>
+      </details>
+    </section>
+  </div>
+
+  <div>
+    <section>
+      <h2>Medir</h2>
+      <div class="row" id="engines"></div>
+      <div id="cliplist"></div>
+      <div class="row">
+        <button class="sec" id="all">todas</button><button class="sec" id="none">nenhuma</button>
+        <span class="dim" id="selinfo"></span>
+      </div>
+      <div class="row">
+        <label><input type="checkbox" id="pause" checked> parar a IA de rostos durante a medição</label>
+      </div>
+      <div class="row"><button id="run">Medir</button><button class="del" id="stop" disabled>Parar</button></div>
+      <div id="prog" class="dim"></div>
+      <div class="bar"><i id="bar"></i></div>
+      <p class="note">Um motor por vez; cada um carrega o modelo uma vez e passa por todas as frases escolhidas. Com a
+        IA de rostos rodando junto, as duas disputam o único núcleo da placa.</p>
+    </section>
+    <section>
+      <h2>Gravar uma frase</h2>
+      <textarea id="ref" rows="3" aria-label="texto a ler (vira a referência do WER)"></textarea>
+      <div class="row">
+        <button class="sec" id="other">outra frase</button>
+        <button id="rec">Gravar</button><span id="rectime" class="dim"></span>
+      </div>
+      <audio id="preview" controls hidden></audio>
+      <div class="row"><button id="send" disabled>Enviar para a placa</button><span id="recmsg"></span></div>
+      <p class="note">Leia o texto acima: ele vira a referência do WER (pode editar). Grava pelo microfone deste
+        computador, até 30 s, e manda para a placa em 16 kHz. O navegador só libera o microfone em
+        http://127.0.0.1 (adb) ou https.</p>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const PHRASES = [
+  'Liga a luz da sala e fecha a cortina, por favor.',
+  'Qual é a previsão do tempo para amanhã de manhã?',
+  'O robô deve olhar para a pessoa que está falando com ele.',
+  'Toca uma música calma e abaixa um pouco o volume.',
+  'Lembra de comprar pão, leite e café quando sair de casa.',
+  'Quantos minutos faltam para o ônibus chegar no ponto?',
+];
+const MAX_REC_S = 30;
+
+let st = null, clipKey = '', engineKey = '';
+const selClips = new Set(), selEngines = new Set();
+let firstState = true, phrase = 0;
+
+/* ---- números e texto ---- */
+const nf = (x, d = 1) => x.toLocaleString('pt-BR', { minimumFractionDigits: d, maximumFractionDigits: d });
+const sec = ms => nf(ms / 1000) + ' s';
+const mb = kb => nf(kb / 1024, 0) + ' MB';
+const pct = x => nf(x * 100, 0) + '%';
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+function dur(ms) { const s = Math.round(ms / 1000); return s < 60 ? s + ' s' : Math.floor(s / 60) + ' min ' + (s % 60) + ' s'; }
+
+/* Números por extenso (o whisper escreve "4 anos", a referência "quatro anos"). */
+const UN = ['zero','um','dois','três','quatro','cinco','seis','sete','oito','nove','dez','onze','doze','treze','quatorze',
+  'quinze','dezesseis','dezessete','dezoito','dezenove'];
+const DEZ = ['','','vinte','trinta','quarenta','cinquenta','sessenta','setenta','oitenta','noventa'];
+const CEM = ['','cento','duzentos','trezentos','quatrocentos','quinhentos','seiscentos','setecentos','oitocentos','novecentos'];
+function ate999(n) {
+  if (n < 20) return UN[n];
+  if (n < 100) return DEZ[Math.floor(n / 10)] + (n % 10 ? ' e ' + UN[n % 10] : '');
+  if (n === 100) return 'cem';
+  return CEM[Math.floor(n / 100)] + (n % 100 ? ' e ' + ate999(n % 100) : '');
+}
+function extenso(n) {
+  if (n < 1000) return ate999(n);
+  if (n >= 1e6) return String(n);
+  const k = Math.floor(n / 1000), r = n % 1000, mil = k === 1 ? 'mil' : ate999(k) + ' mil';
+  return r ? mil + (r < 100 || r % 100 === 0 ? ' e ' : ' ') + ate999(r) : mil;
+}
+function words(s) {
+  return s.toLowerCase().replace(/\d+/g, m => ' ' + extenso(+m) + ' ')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ').trim().split(' ').filter(Boolean);
+}
+
+/* Alinhamento por distância de edição: erros e a lista de operações para marcar o texto. */
+function align(ref, hyp) {
+  const n = ref.length, m = hyp.length, d = [];
+  for (let i = 0; i <= n; i++) { d.push(new Uint16Array(m + 1)); d[i][0] = i; }
+  for (let j = 0; j <= m; j++) d[0][j] = j;
+  for (let i = 1; i <= n; i++) for (let j = 1; j <= m; j++)
+    d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (ref[i - 1] === hyp[j - 1] ? 0 : 1));
+  const ops = [];
+  for (let i = n, j = m; i > 0 || j > 0;) {
+    if (i > 0 && j > 0 && d[i][j] === d[i - 1][j - 1] + (ref[i - 1] === hyp[j - 1] ? 0 : 1)) {
+      ops.push({ t: ref[i - 1] === hyp[j - 1] ? 'ok' : 'sub', r: ref[i - 1], h: hyp[j - 1] }); i--; j--;
+    } else if (j > 0 && d[i][j] === d[i][j - 1] + 1) { ops.push({ t: 'ins', h: hyp[j - 1] }); j--; }
+    else { ops.push({ t: 'del', r: ref[i - 1] }); i--; }
+  }
+  return { errors: d[n][m], words: n, ops: ops.reverse() };
+}
+
+function diffHtml(ops) {
+  return ops.map(o => o.t === 'ok' ? esc(o.h) : o.t === 'sub' ? `<mark title="era: ${esc(o.r)}">${esc(o.h)}</mark>`
+    : o.t === 'ins' ? `<mark class="ins" title="sobrando">${esc(o.h)}</mark>` : `<del title="faltando">${esc(o.r)}</del>`).join(' ');
+}
+
+/* ---- estado da placa: um pedido por vez; 1/s medindo, a cada 4 s parada ---- */
+let pollTimer = 0, polling = false, again = false;
+async function poll() {
+  if (polling) { again = true; return; }
+  polling = true;
+  clearTimeout(pollTimer);
+  let wait = 4000;
+  try {
+    const r = await fetch('/asr/state', { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    st = await r.json();
+    render();
+    if (st.job.running) wait = 1000;
+  } catch (e) {
+    $('live').textContent = 'sem conexão'; $('live').className = '';
+    wait = 2000;
+  }
+  polling = false;
+  if (again) { again = false; poll(); return; }
+  pollTimer = setTimeout(poll, wait);
+}
+
+const clipOf = file => file.replace(/\.wav$/, '');
+const refOf = name => (st.clips.find(c => c.name === name) || {}).ref || '';
+
+function render() {
+  const job = st.job;
+  $('live').textContent = !st.ready ? 'asr_bench não instalado' : job.running ? `medindo ${job.done}/${job.total}` : 'pronta';
+  $('live').className = !st.ready ? '' : job.running ? 'busy' : 'on';
+  $('mem').textContent = `memória livre ${nf(st.mem_avail / 1048576, 0)} MB`;
+  renderControls();
+  renderResults();
+}
+
+function renderControls() {
+  const job = st.job;
+  const ek = st.engines.join(',');
+  if (ek !== engineKey) {
+    engineKey = ek;
+    if (!selEngines.size) st.engines.forEach(e => selEngines.add(e));
+    $('engines').innerHTML = st.engines.length ? st.engines.map(e =>
+      `<label><input type="checkbox" data-e="${esc(e)}" ${selEngines.has(e) ? 'checked' : ''}> <span class="eng">${esc(e)}</span></label>`).join('')
+      : `<span class="err">sem motores: rode scripts/asr.sh deploy (pasta ${esc(st.dir)})</span>`;
+    $('engines').querySelectorAll('input').forEach(i => i.onchange = () => {
+      i.checked ? selEngines.add(i.dataset.e) : selEngines.delete(i.dataset.e); updateSel(); });
+  }
+  const ck = st.clips.map(c => c.name + c.ref).join('|');
+  if (ck !== clipKey) {
+    clipKey = ck;
+    if (firstState) st.clips.forEach(c => { if (!c.name.startsWith('rec-')) selClips.add(c.name); });
+    for (const n of [...selClips]) if (!st.clips.some(c => c.name === n)) selClips.delete(n);
+    $('cliplist').innerHTML = st.clips.length ? st.clips.map(c => `
+      <label class="ci"><input type="checkbox" data-c="${esc(c.name)}" ${selClips.has(c.name) ? 'checked' : ''}>
+        <b>${esc(c.name)}</b>
+        <span class="meta">${sec(c.ms)}<button class="play" data-p="${esc(c.name)}" title="ouvir">▶</button>
+          ${c.name.startsWith('rec-') ? `<button class="play" data-d="${esc(c.name)}" title="apagar a gravação">✕</button>` : ''}</span>
+        <small title="${esc(c.ref)}">${esc(c.ref) || '<i>sem texto de referência (sem WER)</i>'}</small>
+      </label>`).join('') : '<p class="dim" style="padding:8px">nenhuma frase em clips/</p>';
+    $('cliplist').querySelectorAll('input').forEach(i => i.onchange = () => {
+      i.checked ? selClips.add(i.dataset.c) : selClips.delete(i.dataset.c); updateSel(); });
+    $('cliplist').querySelectorAll('[data-p]').forEach(b => b.onclick = e => { e.preventDefault(); play(b.dataset.p); });
+    $('cliplist').querySelectorAll('[data-d]').forEach(b => b.onclick = e => { e.preventDefault(); delRec(b.dataset.d); });
+  }
+  firstState = false;
+  updateSel();
+
+  $('stop').disabled = !job.running;
+  const pctDone = job.total ? job.done / job.total : 0;
+  $('bar').style.width = (job.running ? pctDone * 100 : 0) + '%';
+  if (job.running) {
+    $('prog').innerHTML = `<span class="eng">${esc(job.engine)}</span> · ${esc(job.clip)} · ${job.done}/${job.total} prontas · ${dur(job.elapsed_ms)}` +
+      (job.pause_ai ? ' · IA de rostos parada' : '');
+  } else if (job.total) {
+    $('prog').innerHTML = `última medição: ${job.done}/${job.total} em ${dur(job.elapsed_ms)}` +
+      (job.error ? `<br><span class="err">${esc(job.error)}</span>` : '');
+  }
+}
+
+function updateSel() {
+  const ms = st ? st.clips.filter(c => selClips.has(c.name)).reduce((a, c) => a + c.ms, 0) : 0;
+  $('selinfo').textContent = `${selClips.size} frase(s), ${sec(ms)} de fala`;
+  $('run').disabled = !st || !st.ready || st.job.running || !selClips.size || !selEngines.size;
+}
+
+function renderResults() {
+  /* Última medição de cada (motor, frase); o arquivo é cronológico. */
+  const last = new Map();
+  for (const r of st.results) last.set(r.engine + '|' + clipOf(r.file), r);
+  const engines = [...new Set([...st.engines, ...st.results.map(r => r.engine)])].filter(e => [...last.values()].some(r => r.engine === e));
+  const scored = r => {
+    const ref = refOf(clipOf(r.file));
+    return r.error || !ref ? null : align(words(ref), words(r.text));
+  };
+
+  $('summary').innerHTML = engines.length ? engines.map(e => {
+    const rs = [...last.values()].filter(r => r.engine === e), ok = rs.filter(r => !r.error);
+    const sum = k => ok.reduce((a, r) => a + (r[k] || 0), 0);
+    const audio = sum('audio_ms'), proc = sum('proc_ms'), cpu = sum('cpu_ms');
+    let errs = 0, refw = 0;
+    for (const r of ok) { const a = scored(r); if (a) { errs += a.errors; refw += a.words; } }
+    const rtf = audio ? proc / audio : 0;
+    const enc = sum('encode_ms');
+    const ram = Math.max(0, ...ok.map(r => r.maxrss_kb || 0));
+    const load = ok.length ? ok[ok.length - 1].load_ms : 0;
+    return `<div class="ecard"><h3>${esc(e)}</h3>
+      <div class="big">
+        <div><span>RTF</span><b class="${rtf < 1 ? 'ok' : 'warn'}">${ok.length ? nf(rtf, 2) : '–'}</b></div>
+        <div><span>WER</span><b>${refw ? pct(errs / refw) : '–'}</b></div>
+        <div><span>RAM pico</span><b>${ok.length ? mb(ram) : '–'}</b></div>
+      </div>
+      <dl>
+        <dt>frases</dt><dd>${ok.length}${rs.length > ok.length ? ` <span class="err">+${rs.length - ok.length} com erro</span>` : ''}</dd>
+        <dt>fala / processamento</dt><dd>${sec(audio)} / ${sec(proc)}</dd>
+        <dt>pior frase (RTF)</dt><dd>${ok.length ? nf(Math.max(...ok.map(r => r.rtf)), 2) : '–'}</dd>
+        <dt>carregar o modelo</dt><dd>${ok.length ? sec(load) : '–'}</dd>
+        <dt>uso da CPU</dt><dd>${proc ? pct(cpu / proc) : '–'}</dd>
+        ${enc ? `<dt>encoder / decoder</dt><dd>${pct(enc / proc)} / ${pct(sum('decode_ms') / proc)}</dd>` : ''}
+        <dt>erros / palavras</dt><dd>${refw ? `${errs} / ${refw}` : '–'}</dd>
+        <dt>modelo</dt><dd>${esc((ok[0] || rs[0] || {}).model || '')}</dd>
+      </dl></div>`;
+  }).join('') : '<p class="dim">nenhuma medição ainda</p>';
+
+  const clips = [...new Set([...last.values()].map(r => clipOf(r.file)))].sort();
+  $('byclip').innerHTML = clips.length ? clips.map(c => {
+    const rs = engines.map(e => last.get(e + '|' + c)).filter(Boolean);
+    const clip = st.clips.find(x => x.name === c);
+    return `<div class="clip">
+      <div class="row" style="margin:0"><b>${esc(c)}</b><span class="dim">${rs[0] && rs[0].audio_ms ? sec(rs[0].audio_ms) : ''}</span>
+        ${clip ? `<button class="play" data-p="${esc(c)}" title="ouvir">▶</button>` : '<span class="dim">(arquivo apagado)</span>'}</div>
+      <div class="ref">${esc(refOf(c)) || '<i>sem texto de referência</i>'}</div>
+      <div class="scroll"><table>
+        <thead><tr><th class="l">motor</th><th>proc.</th><th>RTF</th><th>WER</th><th class="l">reconhecido</th></tr></thead>
+        <tbody>${rs.map(r => {
+          if (r.error) return `<tr><td class="l eng">${esc(r.engine)}</td><td colspan="4" class="txt err">${esc(r.error)}</td></tr>`;
+          const a = scored(r);
+          return `<tr><td class="l eng">${esc(r.engine)}</td><td>${sec(r.proc_ms)}</td><td class="${r.rtf < 1 ? 'ok' : 'warn'}">${nf(r.rtf, 2)}</td>
+            <td>${a ? pct(a.words ? a.errors / a.words : 0) : '–'}</td>
+            <td class="txt" title="${esc(r.text)}">${a ? diffHtml(a.ops) : esc(r.text) || '<i class="dim">(nada)</i>'}</td></tr>`;
+        }).join('')}</tbody></table></div></div>`;
+  }).join('') : '<p class="dim">nenhuma medição ainda</p>';
+  $('byclip').querySelectorAll('[data-p]').forEach(b => b.onclick = () => play(b.dataset.p));
+
+  $('histsum').textContent = `Todas as medições (${st.results.length})`;
+  $('hist').innerHTML = st.results.length ? st.results.slice().reverse().map(r => {
+    const when = new Date(r.run * 1000).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+    if (r.error) return `<tr><td class="l">${when}</td><td class="l eng">${esc(r.engine)}</td><td class="l">${esc(clipOf(r.file))}</td>
+      <td colspan="8" class="txt err">${esc(r.error)}</td></tr>`;
+    const a = scored(r);
+    return `<tr><td class="l">${when}</td><td class="l eng">${esc(r.engine)}</td><td class="l">${esc(clipOf(r.file))}</td>
+      <td>${sec(r.audio_ms)}</td><td>${sec(r.proc_ms)}</td><td>${nf(r.rtf, 2)}</td><td>${r.proc_ms ? pct(r.cpu_ms / r.proc_ms) : '–'}</td>
+      <td>${mb(r.maxrss_kb)}</td><td>${sec(r.load_ms)}</td><td>${a ? pct(a.words ? a.errors / a.words : 0) : '–'}</td>
+      <td class="l">${r.pause_ai ? 'parada' : 'rodando'}</td></tr>`;
+  }).join('') : '<tr><td colspan="11" class="none">nenhuma medição ainda</td></tr>';
+}
+
+/* ---- controles ---- */
+async function post(url, body) {
+  const r = await fetch(url, { method: 'POST', body });
+  const j = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status }));
+  return j;
+}
+let audio = null;
+function play(name) {
+  if (audio) audio.pause();
+  audio = new Audio('/asr/clip?name=' + encodeURIComponent(name));
+  audio.play();
+}
+async function delRec(name) {
+  if (!confirm(`Apagar a gravação ${name}?`)) return;
+  const j = await post('/asr/delete?name=' + encodeURIComponent(name));
+  if (!j.ok) alert(j.error);
+  selClips.delete(name); clipKey = ''; poll();
+}
+$('all').onclick = () => { if (!st) return; st.clips.forEach(c => selClips.add(c.name)); clipKey = ''; render(); };
+$('none').onclick = () => { if (!st) return; selClips.clear(); clipKey = ''; render(); };
+$('run').onclick = async () => {
+  const engines = st.engines.filter(e => selEngines.has(e)), clips = st.clips.filter(c => selClips.has(c.name)).map(c => c.name);
+  const j = await post(`/asr/run?engines=${encodeURIComponent(engines.join(','))}&clips=${encodeURIComponent(clips.join(','))}` +
+    `&pause=${$('pause').checked ? 1 : 0}`);
+  if (!j.ok) alert(j.error);
+  poll();
+};
+$('stop').onclick = async () => { await post('/asr/stop'); poll(); };
+$('clear').onclick = async () => {
+  if (!confirm('Apagar todos os resultados da placa?')) return;
+  await post('/asr/clear'); poll();
+};
+
+/* ---- gravação: microfone do PC -> 16 kHz mono 16 bits -> placa ---- */
+let rec = null, wav = null;
+function showPhrase() { $('ref').value = PHRASES[phrase % PHRASES.length]; }
+$('other').onclick = () => { phrase++; showPhrase(); };
+
+function encodeWav(samples) {
+  const buf = new ArrayBuffer(44 + samples.length * 2), v = new DataView(buf);
+  const str = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  str(0, 'RIFF'); v.setUint32(4, 36 + samples.length * 2, true); str(8, 'WAVEfmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, 16000, true); v.setUint32(28, 32000, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, 'data'); v.setUint32(40, samples.length * 2, true);
+  samples.forEach((s, i) => v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, s)) * 32767, true));
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+async function startRec() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    $('recmsg').innerHTML = '<span class="err">microfone bloqueado: abra por http://127.0.0.1:8080 (scripts/face_app.sh web)</span>';
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false } });
+  } catch (e) { $('recmsg').innerHTML = `<span class="err">sem microfone: ${esc(e.message)}</span>`; return; }
+  const ctx = new AudioContext(), src = ctx.createMediaStreamSource(stream), node = ctx.createScriptProcessor(4096, 1, 1);
+  const chunks = [];
+  node.onaudioprocess = e => chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  src.connect(node); node.connect(ctx.destination);
+  const t0 = performance.now();
+  rec = { stream, ctx, src, node, chunks, timer: setInterval(() => {
+    const s = (performance.now() - t0) / 1000;
+    $('rectime').textContent = nf(s) + ' s';
+    if (s >= MAX_REC_S) stopRec();
+  }, 100) };
+  $('rec').textContent = 'Parar'; $('rec').classList.add('on'); $('send').disabled = true; $('recmsg').textContent = '';
+}
+
+async function stopRec() {
+  const r = rec; rec = null;
+  clearInterval(r.timer);
+  r.node.disconnect(); r.src.disconnect(); r.stream.getTracks().forEach(t => t.stop());
+  const rate = r.ctx.sampleRate; await r.ctx.close();
+  $('rec').textContent = 'Gravar'; $('rec').classList.remove('on');
+  const n = r.chunks.reduce((a, c) => a + c.length, 0);
+  if (!n) return;
+  const all = new Float32Array(n);
+  let o = 0;
+  for (const c of r.chunks) { all.set(c, o); o += c.length; }
+  /* O navegador grava na taxa da placa de som (48 kHz em geral); o
+   * OfflineAudioContext reamostra para 16 kHz com filtro. */
+  const off = new OfflineAudioContext(1, Math.ceil(n * 16000 / rate), 16000);
+  const b = off.createBuffer(1, n, rate);
+  b.copyToChannel(all, 0);
+  const s = off.createBufferSource(); s.buffer = b; s.connect(off.destination); s.start();
+  wav = encodeWav((await off.startRendering()).getChannelData(0));
+  $('preview').src = URL.createObjectURL(wav); $('preview').hidden = false;
+  $('send').disabled = false;
+}
+$('rec').onclick = () => rec ? stopRec() : startRec();
+$('send').onclick = async () => {
+  $('send').disabled = true; $('recmsg').textContent = 'enviando…';
+  const j = await post('/asr/upload?ref=' + encodeURIComponent($('ref').value.trim()), wav);
+  if (!j.ok) { $('recmsg').innerHTML = `<span class="err">${esc(j.error)}</span>`; $('send').disabled = false; return; }
+  $('recmsg').innerHTML = `<span class="ok">gravada como ${esc(j.name)} e marcada na lista</span>`;
+  selClips.add(j.name); clipKey = ''; phrase++; showPhrase(); poll();
+};
+
+showPhrase();
+poll();
+</script>

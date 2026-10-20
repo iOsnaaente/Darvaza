@@ -9,9 +9,13 @@ MIPI CSI. Roda a imagem **Buildroot** da Luckfox (uclibc).
 | `setup.sh` | baixa o toolchain e os exemplos da Luckfox (commits fixos) |
 | `env.sh` | `source env.sh` em cada terminal: PATH, `adb`, `BOARD_LINK` |
 | `cmake/rv1106.cmake` | toolchain CMake para os nossos projetos |
+| `face_app/` | **o app**: reconhecimento facial igual ao `imx708_capture` do ESP32-P4 ([README](face_app/README.md)) |
+| `asr_bench/` | reconhecimento de fala na placa: whisper.cpp tiny × Vosk small pt, resultados na página Fala do `face_app` ([README](asr_bench/README.md)) |
 | `npu_check/` | teste da cadeia toda: compila, copia e roda inferência na NPU |
 | `scripts/build_example.sh` | compila um exemplo oficial sem o menu interativo |
 | `scripts/deploy.sh` | copia uma pasta para a placa (adb ou ssh) |
+| `scripts/face_app.sh` | build, deploy, start/stop e monitor do `face_app` |
+| `scripts/asr.sh` | downloads, build, deploy e execução do `asr_bench` |
 | `udev/51-rockchip.rules` | permissão de USB para a placa (ADB e modo MaskRom) |
 | `sdk/`, `third_party/` | baixados pelo `setup.sh`, fora do git |
 
@@ -49,10 +53,11 @@ e na WSL, a permissão de USB:
 sudo cp udev/51-rockchip.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-A cada vez que ligar a placa (ou ela reiniciar), no PowerShell:
+A cada vez que ligar a placa (ou ela reiniciar), no PowerShell (pelo ID da
+placa, vale em qualquer porta USB; `--auto-attach` reanexa sozinho):
 
 ```powershell
-usbipd attach --wsl --busid 2-2        # --auto-attach para reanexar sozinho
+usbipd attach --wsl --hardware-id 2207:0019 --auto-attach
 ```
 
 Na WSL, depois do `source env.sh`:

@@ -238,6 +238,33 @@ static int box_w(const dl::detect::result_t &d)
     return d.box[2] - d.box[0];
 }
 
+/* Brilho do rosto para a exposição (isp_tune): média de Y = (77R + 150G + 29B)
+ * / 256 numa grade de LUMA_GRID x LUMA_GRID pontos no miolo da caixa - metade
+ * central da largura, da testa ao queixo - sem o fundo e o cabelo das bordas.
+ * São 256 leituras: microssegundos, contra os ~16 ms da detecção. */
+#define LUMA_GRID 16
+
+static int face_luma(const uint8_t *img, const int *box)
+{
+    int w = box[2] - box[0], h = box[3] - box[1];
+    int x0 = box[0] + w / 4, x1 = box[2] - w / 4;
+    int y0 = box[1] + h / 5, y1 = box[3] - h / 10;
+    if (x1 <= x0 || y1 <= y0) {
+        return -1;
+    }
+    const uint16_t *px = (const uint16_t *)img;
+    uint32_t sum = 0;
+    for (int j = 0; j < LUMA_GRID; j++) {
+        const uint16_t *row = px + (size_t)(y0 + (y1 - y0) * (2 * j + 1) / (2 * LUMA_GRID)) * s_w;
+        for (int i = 0; i < LUMA_GRID; i++) {
+            uint16_t p = row[x0 + (x1 - x0) * (2 * i + 1) / (2 * LUMA_GRID)];
+            int r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
+            sum += 77 * ((r << 3) | (r >> 2)) + 150 * ((g << 2) | (g >> 4)) + 29 * ((b << 3) | (b >> 2));
+        }
+    }
+    return (int)(sum / (LUMA_GRID * LUMA_GRID) / 256);
+}
+
 /* ---- Tracking ------------------------------------------------------------------
  *
  * A detecção roda em todo quadro; o reconhecimento (~120 ms por rosto neste
@@ -364,9 +391,10 @@ static face_result_t s_res;
 static int64_t s_res_time;
 static face_stats_t s_stats;
 
-static void publish(int64_t frame_us)
+static void publish(int64_t frame_us, int luma)
 {
     face_result_t out = {};
+    out.luma = (int16_t)luma;
     for (int j = 0; j < MAX_TRACKS && out.n < FACE_MAX_BOXES; j++) {
         const track_t &t = s_tracks[j];
         if (t.live) {
@@ -592,6 +620,7 @@ static void ai_task(void *)
         if (dets.size() > MAX_TRACKS) {
             dets.resize(MAX_TRACKS);
         }
+        int luma = dets.empty() ? -1 : face_luma(s_img, dets[0].box.data());
 
         int track_of[MAX_TRACKS];
         associate(dets, track_of, frame_us);
@@ -608,7 +637,7 @@ static void ai_task(void *)
 
         /* Publica antes de devolver o buffer: a captura recorta as caixas
          * deste mesmo quadro para a web, então elas têm de ser as dele. */
-        publish(frame_us);
+        publish(frame_us, luma);
         if (!gave_frame) {
             s_release(s_img_index, true);
         }
@@ -703,10 +732,24 @@ esp_err_t face_init(int width, int height, face_release_fn release)
     return ESP_OK;
 }
 
+/* Pausa pedida pela página de fala: a IA para de aceitar quadros e o core 1
+ * fica livre. A câmera continua (o AE segue convergido). */
+static std::atomic<bool> s_paused{false};
+
+void face_pause(bool paused)
+{
+    s_paused.store(paused);
+}
+
+bool face_paused(void)
+{
+    return s_paused.load();
+}
+
 bool face_offer_frame(uint8_t *rgb565, int buf_index)
 {
     s_frames_seen.fetch_add(1);
-    if (!s_task || s_busy.load()) {
+    if (!s_task || s_paused.load() || s_busy.load()) {
         return false;
     }
     s_frame_us.store(esp_timer_get_time());
@@ -720,6 +763,7 @@ bool face_offer_frame(uint8_t *rgb565, int buf_index)
 void face_get_result(face_result_t *out, uint32_t max_age_ms)
 {
     *out = {};
+    out->luma = -1;
     if (!s_res_lock) {
         return;
     }
@@ -729,6 +773,7 @@ void face_get_result(face_result_t *out, uint32_t max_age_ms)
     xSemaphoreGive(s_res_lock);
     if (stale) {
         out->n = 0;
+        out->luma = -1;
     }
 }
 
