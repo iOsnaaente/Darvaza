@@ -343,7 +343,7 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.5.4
+    version: 5.5.6
   mushbraindave/esp_cam_sensor_imx:
     component_hash: 0b563f169be4677e0a78a74646144154601ea425160b173d217eab57c5496040
     dependencies:

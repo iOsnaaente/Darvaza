@@ -20,6 +20,8 @@
  *   GET  /quality?q=N   qualidade JPEG ao vivo (1..100)
  *   POST /enroll        cadastra o maior rosto da imagem; devolve o ID
  *   POST /delete?id=N   apaga um cadastro (id=all apaga todos)
+ *   POST /gaze/calib    o maior rosto, olhando para a câmera, vira o olhar 0,0
+ *                       (?reset=1 tira a calibração)
  *   GET  /isp           ajuste do ISP: valores, faixas e dados do JSON (isp_tune.h)
  *   POST /isp?k=v&...   muda e aplica na hora; /isp?save grava na NVS,
  *                       /isp?reset volta ao tuning do firmware
@@ -108,16 +110,16 @@
 #define FRAME_MAX_FPS       15
 /* Quadro pronto mais velho que isto não serve para quem pede: espera um novo. */
 #define FRAME_FRESH_MS      300
-#define FRAME_FACES_CAP     640     /* caixas de um quadro em JSON (cabeçalho X-Faces) */
+#define FRAME_FACES_CAP     1280    /* caixas de um quadro em JSON (cabeçalho X-Faces) */
 #define FRAME_QUEUE_LEN     4       /* pedidos do /frame.jpg esperando a vez */
-#define FRAME_TASK_STACK    6144
+#define FRAME_TASK_STACK    7168
 
 /* Cada espectador custa uma task, um buffer em PSRAM e um socket; e todos
  * dividem a mesma banda. */
 #define MAX_VIEWERS         2
 #define EVENTS_TASK_STACK   6144
 #define EVENTS_POLL_MS      5       /* de quanto em quanto o espectador olha se há novidade */
-#define EVENT_TEXT_CAP      2048    /* evento faces ou stats */
+#define EVENT_TEXT_CAP      3072    /* evento faces ou stats (também o corpo do /status) */
 #define STATS_PERIOD_US     (1000 * 1000)
 /* Nível do microfone para a página: 20/s basta para o slider andar liso, e
  * cada evento tem uns 40 bytes. */
@@ -607,17 +609,29 @@ static esp_err_t send_json(httpd_req_t *req, const char *status, const char *bod
     return httpd_resp_sendstr(req, body);
 }
 
-/* [{"trk","id","sim","x","y","dx","dy","age"}, ...]: x,y,dx,dy como no
- * terminal (face.h); age = ms desde que o rosto apareceu. */
+/* [{"trk","id","sim","x","y","dx","dy","age","kp","g","look","eyes","pu"}, ...]:
+ * x,y,dx,dy como no terminal (face.h); age = ms desde que o rosto apareceu;
+ * kp = os 5 pontos (x,y) do rosto; g = olhar yaw, pitch, cabeça yaw, pitch,
+ * olhos yaw, pitch, em graus (gaze.h); look = olhando para a câmera; eyes =
+ * achou a pupila; pu = pupilas xe,ye,xd,yd (-1 = não achou). */
 static size_t faces_json(char *buf, size_t cap, size_t used, const face_result_t *r)
 {
     APPEND(buf, cap, used, "[");
     for (size_t i = 0; i < r->n; i++) {
         const face_box_t *b = &r->box[i];
+        const gaze_t *g = &b->gaze;
         APPEND(buf, cap, used,
-               "%s{\"trk\":%" PRIu32 ",\"id\":%d,\"sim\":%u,\"x\":%d,\"y\":%d,\"dx\":%d,\"dy\":%d,\"age\":%" PRId64 "}",
+               "%s{\"trk\":%" PRIu32 ",\"id\":%d,\"sim\":%u,\"x\":%d,\"y\":%d,\"dx\":%d,\"dy\":%d,\"age\":%" PRId64
+               ",\"kp\":[",
                i ? "," : "", b->track, b->id, b->sim_pct, (b->x0 + b->x1) / 2, (b->y0 + b->y1) / 2,
                b->x1 - b->x0, b->y1 - b->y0, (r->frame_us - b->since_us) / 1000);
+        for (int k = 0; k < 10; k++) {
+            APPEND(buf, cap, used, "%s%d", k ? "," : "", b->kp[k]);
+        }
+        APPEND(buf, cap, used,
+               "],\"g\":[%.1f,%.1f,%.1f,%.1f,%.1f,%.1f],\"look\":%d,\"eyes\":%d,\"pu\":[%d,%d,%d,%d]}",
+               b->yaw, b->pitch, g->head_yaw, g->head_pitch, g->eye_yaw, g->eye_pitch, b->look, g->eyes,
+               g->pupil[0], g->pupil[1], g->pupil[2], g->pupil[3]);
     }
     APPEND(buf, cap, used, "]");
     return used;
@@ -650,6 +664,10 @@ static size_t status_json(char *buf, size_t cap, size_t used)
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), res.frame_us / 1000);
     used = faces_json(buf, cap, used, &res);
+
+    float off[4];
+    face_gaze_offsets(off);
+    APPEND(buf, cap, used, ",\"gaze_cal\":[%.1f,%.1f,%.1f,%.1f]", off[0], off[1], off[2], off[3]);
 
     int ids[64];
     size_t total = face_list(ids, sizeof(ids) / sizeof(ids[0]));
@@ -974,15 +992,23 @@ static esp_err_t frame_handler(httpd_req_t *req)
 
 static esp_err_t status_handler(httpd_req_t *req)
 {
-    char body[1536];
-    size_t used = status_json(body, sizeof(body), 0);
-    APPEND(body, sizeof(body), used, "\n");
-    if (used >= sizeof(body)) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "status grande demais");
+    /* Com o olhar, 4 rostos já passam de 1 KB: não cabe na pilha do httpd. */
+    char *body = heap_caps_malloc(EVENT_TEXT_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!body) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sem memoria");
     }
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    return httpd_resp_send(req, body, used);
+    size_t used = status_json(body, EVENT_TEXT_CAP, 0);
+    APPEND(body, EVENT_TEXT_CAP, used, "\n");
+    esp_err_t err;
+    if (used >= EVENT_TEXT_CAP) {
+        err = httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "status grande demais");
+    } else {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+        err = httpd_resp_send(req, body, used);
+    }
+    free(body);
+    return err;
 }
 
 static esp_err_t quality_handler(httpd_req_t *req)
@@ -1042,6 +1068,17 @@ static esp_err_t delete_handler(httpd_req_t *req)
     }
     if (err != ESP_OK) {
         return send_json(req, "500 Internal Server Error", "{\"ok\":false,\"error\":\"falha ao gravar\"}");
+    }
+    return send_json(req, NULL, "{\"ok\":true}");
+}
+
+static esp_err_t gaze_calib_handler(httpd_req_t *req)
+{
+    char query[32], val[4];
+    bool reset = httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+                 httpd_query_key_value(query, "reset", val, sizeof(val)) == ESP_OK && strcmp(val, "1") == 0;
+    if (!face_gaze_calibrate(reset)) {
+        return send_json(req, "409 Conflict", "{\"ok\":false,\"error\":\"nenhum rosto na imagem\"}");
     }
     return send_json(req, NULL, "{\"ok\":true}");
 }
@@ -1128,7 +1165,7 @@ static bool start_server(void)
      * navegador o reaproveita a cada quadro); sobram 3 para página, foto e
      * status. */
     cfg.max_open_sockets = MAX_VIEWERS * 2 + 3;
-    cfg.max_uri_handlers = 24;      /* 12 daqui + 10 da página de fala */
+    cfg.max_uri_handlers = 24;      /* 13 daqui + 10 da página de fala */
     cfg.lru_purge_enable = true;
 
     httpd_handle_t server = NULL;
@@ -1146,6 +1183,7 @@ static bool start_server(void)
         { .uri = "/quality",     .method = HTTP_GET,  .handler = quality_handler },
         { .uri = "/enroll",      .method = HTTP_POST, .handler = enroll_handler },
         { .uri = "/delete",      .method = HTTP_POST, .handler = delete_handler },
+        { .uri = "/gaze/calib",  .method = HTTP_POST, .handler = gaze_calib_handler },
         { .uri = "/isp",         .method = HTTP_GET,  .handler = isp_get_handler },
         { .uri = "/isp",         .method = HTTP_POST, .handler = isp_post_handler },
         { .uri = "/audio",       .method = HTTP_POST, .handler = audio_handler },
@@ -1348,7 +1386,7 @@ static esp_err_t camera_start(void)
         ESP_LOGE(TAG, "sem memória para a fila de buffers");
         return ESP_ERR_NO_MEM;
     }
-    if (xTaskCreatePinnedToCore(capture_task, "capture", 6144, NULL, 6, NULL, 0) != pdPASS) {
+    if (xTaskCreatePinnedToCore(capture_task, "capture", 7168, NULL, 6, NULL, 0) != pdPASS) {
         ESP_LOGE(TAG, "falha ao criar a task de captura");
         return ESP_FAIL;
     }

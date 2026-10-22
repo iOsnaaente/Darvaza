@@ -1,5 +1,5 @@
 {
-    "idf.currentSetup": "/home/iosnaaente/esp/v5.5.4/esp-idf",
+    "idf.currentSetup": "/home/qiron/.espressif/v5.5.6/esp-idf",
     "idf.customExtraVars": {
         "IDF_PATH": "/home/iosnaaente/esp/v5.5.4/esp-idf",
         "IDF_TOOLS_PATH": "/home/iosnaaente/.espressif",

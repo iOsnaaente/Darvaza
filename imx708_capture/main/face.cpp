@@ -54,6 +54,9 @@ static const char *TAG = "face";
 #define RETRY_UNKNOWN_US    (200 * 1000)       /* desconhecido: tenta de novo a cada */
 #define SUMMARY_US          (5 * 1000 * 1000)  /* linha "#" de resumo no terminal */
 
+/* Olhar: "para a câmera" = olhar a menos disso do centro, em graus. */
+#define GAZE_LOOK_DEG       12.0f
+
 #define AI_TASK_STACK       6144
 #define AI_TASK_PRIO        4
 #define AI_TASK_CORE        1
@@ -233,6 +236,30 @@ static bool extract(const dl::image::img_t &img, const std::vector<int> &keypoin
     return true;
 }
 
+/* Os 5 pontos do esp-dl vêm como olho esquerdo, canto esquerdo da boca,
+ * nariz, olho direito, canto direito da boca (a mesma ordem do rosto-modelo
+ * do alinhamento do HumanFaceFeat). O gaze.h usa a ordem do RetinaFace: olho
+ * esquerdo, olho direito, nariz, canto esquerdo, canto direito - esquerdo e
+ * direito da imagem. */
+static bool face_kp(const dl::detect::result_t &d, int *kp)
+{
+    if (d.keypoint.size() < 10) {
+        return false;
+    }
+    static const int FROM[5] = {0, 3, 2, 1, 4};
+    for (int i = 0; i < 5; i++) {
+        kp[2 * i] = d.keypoint[2 * FROM[i]];
+        kp[2 * i + 1] = d.keypoint[2 * FROM[i] + 1];
+    }
+    if (kp[0] > kp[2]) {
+        std::swap(kp[0], kp[2]);
+        std::swap(kp[1], kp[3]);
+        std::swap(kp[6], kp[8]);
+        std::swap(kp[7], kp[9]);
+    }
+    return true;
+}
+
 static int box_w(const dl::detect::result_t &d)
 {
     return d.box[2] - d.box[0];
@@ -289,6 +316,9 @@ struct track_t {
     uint32_t gen;           /* muda quando o slot é reaproveitado por outro rosto */
     bool pending;           /* reconhecimento em andamento */
     bool live;
+    int kp[10];             /* pontos do rosto no último quadro (ordem do gaze.h) */
+    gaze_t gaze;            /* suavizado, sem calibração */
+    bool gaze_ok;           /* gaze já tem uma medida */
 };
 
 static track_t s_tracks[MAX_TRACKS];
@@ -390,21 +420,38 @@ static SemaphoreHandle_t s_res_lock;
 static face_result_t s_res;
 static int64_t s_res_time;
 static face_stats_t s_stats;
+static float s_gaze_off[4];   /* calibração: cabeça yaw, pitch; olhos yaw, pitch (com s_res_lock) */
 
 static void publish(int64_t frame_us, int luma)
 {
     face_result_t out = {};
     out.luma = (int16_t)luma;
+    xSemaphoreTake(s_res_lock, portMAX_DELAY);
     for (int j = 0; j < MAX_TRACKS && out.n < FACE_MAX_BOXES; j++) {
         const track_t &t = s_tracks[j];
-        if (t.live) {
-            out.box[out.n++] = {(int16_t)t.box[0], (int16_t)t.box[1], (int16_t)t.box[2], (int16_t)t.box[3],
-                                (int16_t)t.id, (uint8_t)std::clamp((int)(t.sim * 100), 0, 100), t.gen,
-                                t.since_us};
+        if (!t.live) {
+            continue;
         }
+        face_box_t &b = out.box[out.n++];
+        b.x0 = (int16_t)t.box[0];
+        b.y0 = (int16_t)t.box[1];
+        b.x1 = (int16_t)t.box[2];
+        b.y1 = (int16_t)t.box[3];
+        b.id = (int16_t)t.id;
+        b.sim_pct = (uint8_t)std::clamp((int)(t.sim * 100), 0, 100);
+        b.track = t.gen;
+        b.since_us = t.since_us;
+        std::copy(t.kp, t.kp + 10, b.kp);
+        b.gaze = t.gaze;
+        b.gaze.head_yaw -= s_gaze_off[0];
+        b.gaze.head_pitch -= s_gaze_off[1];
+        b.gaze.eye_yaw -= s_gaze_off[2];
+        b.gaze.eye_pitch -= s_gaze_off[3];
+        b.yaw = b.gaze.head_yaw + b.gaze.eye_yaw;
+        b.pitch = b.gaze.head_pitch + b.gaze.eye_pitch;
+        b.look = std::hypot(b.yaw, b.pitch) < GAZE_LOOK_DEG;
     }
     out.frame_us = frame_us;
-    xSemaphoreTake(s_res_lock, portMAX_DELAY);
     out.seq = s_res.seq + 1;
     s_res = out;
     s_res_time = esp_timer_get_time();
@@ -624,6 +671,21 @@ static void ai_task(void *)
 
         int track_of[MAX_TRACKS];
         associate(dets, track_of, frame_us);
+
+        /* Olhar de todo rosto, antes de o buffer ir para o reconhecimento ou
+         * voltar à captura. */
+        for (size_t i = 0; i < dets.size(); i++) {
+            if (track_of[i] < 0) {
+                continue;
+            }
+            track_t &t = s_tracks[track_of[i]];
+            if (face_kp(dets[i], t.kp)) {
+                gaze_t m;
+                gaze_measure(s_img, s_w, s_h, t.kp, &m);
+                gaze_smooth(&t.gaze, &m, !t.gaze_ok);
+                t.gaze_ok = true;
+            }
+        }
 
         bool gave_frame = false;
         if (!s_recog_busy.load()) {
@@ -853,4 +915,55 @@ size_t face_list(int *ids, size_t max)
 void face_get_stats(face_stats_t *out)
 {
     *out = s_stats;
+}
+
+bool face_gaze_calibrate(bool reset)
+{
+    if (!s_res_lock) {
+        return false;
+    }
+    xSemaphoreTake(s_res_lock, portMAX_DELAY);
+    if (reset) {
+        std::fill(s_gaze_off, s_gaze_off + 4, 0.0f);
+        xSemaphoreGive(s_res_lock);
+        ESP_LOGI(TAG, "olhar: calibração zerada");
+        return true;
+    }
+    /* O resultado publicado já vem descontado da correção atual: soma o que
+     * sobrou nele. */
+    const face_box_t *big = nullptr;
+    for (size_t i = 0; i < s_res.n; i++) {
+        const face_box_t &b = s_res.box[i];
+        if (!big || (b.x1 - b.x0) > (big->x1 - big->x0)) {
+            big = &b;
+        }
+    }
+    if (!big || esp_timer_get_time() - s_res_time > 600 * 1000) {
+        xSemaphoreGive(s_res_lock);
+        return false;
+    }
+    s_gaze_off[0] += big->gaze.head_yaw;
+    s_gaze_off[1] += big->gaze.head_pitch;
+    if (big->gaze.eyes) {
+        s_gaze_off[2] += big->gaze.eye_yaw;
+        s_gaze_off[3] += big->gaze.eye_pitch;
+    }
+    bool eyes = big->gaze.eyes;
+    float off[4];
+    std::copy(s_gaze_off, s_gaze_off + 4, off);
+    xSemaphoreGive(s_res_lock);
+    ESP_LOGI(TAG, "olhar calibrado: cabeça %.1f/%.1f, olhos %.1f/%.1f graus%s", off[0], off[1], off[2], off[3],
+             eyes ? "" : " (sem pupila: olhos não calibrados)");
+    return true;
+}
+
+void face_gaze_offsets(float out[4])
+{
+    std::fill(out, out + 4, 0.0f);
+    if (!s_res_lock) {
+        return;
+    }
+    xSemaphoreTake(s_res_lock, portMAX_DELAY);
+    std::copy(s_gaze_off, s_gaze_off + 4, out);
+    xSemaphoreGive(s_res_lock);
 }

@@ -15,6 +15,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "gaze.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,6 +31,10 @@ typedef struct {
     uint8_t sim_pct;          /* semelhança com o cadastro, 0-100 */
     uint32_t track;           /* o mesmo enquanto este rosto é seguido */
     int64_t since_us;         /* quando ele apareceu (esp_timer) */
+    int16_t kp[10];           /* os 5 pontos do rosto (ordem do gaze.h), em pixels do quadro */
+    gaze_t gaze;              /* cabeça e olhos, já com a calibração (gaze.h) */
+    float yaw, pitch;         /* olhar = cabeça + olhos, em graus */
+    bool look;                /* olhando para a câmera */
 } face_box_t;
 
 /* O que a IA achou num quadro. */
@@ -96,6 +101,14 @@ esp_err_t face_delete(int id);
 size_t face_list(int *ids, size_t max);
 
 void face_get_stats(face_stats_t *out);
+
+/* Calibra o olhar: o maior rosto na imagem, olhando para a câmera, passa a
+ * ser yaw = pitch = 0 (cabeça e olhos). reset = volta para sem calibração.
+ * false = nenhum rosto. Vale até reiniciar a placa. */
+bool face_gaze_calibrate(bool reset);
+
+/* Correção atual, em graus: cabeça yaw, pitch; olhos yaw, pitch. */
+void face_gaze_offsets(float out[4]);
 
 #ifdef __cplusplus
 }

@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "asr.c" "audio.c" "isp_tune.c" "imx708_capture_main.c" "face.cpp" "overlay.c" "wifi.c"
+    SRCS "asr.c" "audio.c" "isp_tune.c" "imx708_capture_main.c" "face.cpp" "gaze.cpp" "overlay.c" "wifi.c"
     INCLUDE_DIRS "."
     EMBED_TXTFILES "index.html" "asr.html"
     REQUIRES esp_video esp_cam_sensor_imx esp_driver_jpeg esp_driver_i2c esp_http_server esp_timer
