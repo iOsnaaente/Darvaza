@@ -18,6 +18,7 @@ add_executable(face_app
     src/asr.cpp
     src/camera.cpp
     src/face.cpp
+    src/gaze.cpp
     src/models.cpp
     src/rknn_model.cpp
     src/http.cpp

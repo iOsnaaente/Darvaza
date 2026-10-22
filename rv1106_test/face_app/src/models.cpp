@@ -148,6 +148,33 @@ bool RetinaFace::detect(const Frame &f, std::vector<Det> &out, size_t max_faces)
             out.push_back(d);
         }
     }
+    /* Votação: caixa e pontos de cada rosto = média, pesada pela confiança,
+     * das âncoras que o acharam. Saindo em INT8, cada âncora anda em degraus
+     * de até ~40 px num rosto grande; a média de várias âncoras (degraus
+     * diferentes) fica bem mais fina e estável. */
+    for (Det &k : out) {
+        float sw = 0, acc[14] = {};
+        for (const Det &d : cand) {
+            if (iou(d, k) <= DET_NMS_IOU) {
+                continue;
+            }
+            for (int j = 0; j < 4; j++) {
+                acc[j] += d.score * d.box[j];
+            }
+            for (int j = 0; j < 10; j++) {
+                acc[4 + j] += d.score * d.kp[j];
+            }
+            sw += d.score;
+        }
+        if (sw > 0) {
+            for (int j = 0; j < 4; j++) {
+                k.box[j] = (int)std::lround(acc[j] / sw);
+            }
+            for (int j = 0; j < 10; j++) {
+                k.kp[j] = (int)std::lround(acc[4 + j] / sw);
+            }
+        }
+    }
     std::sort(out.begin(), out.end(), [](const Det &a, const Det &b) { return a.area() > b.area(); });
     if (out.size() > max_faces) {
         out.resize(max_faces);

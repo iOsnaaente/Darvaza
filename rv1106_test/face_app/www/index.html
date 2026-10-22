@@ -5,7 +5,7 @@
 <title>Rostos ao vivo</title>
 <style>
 :root{--bg:#0e1116;--panel:#161b22;--line:#2a313c;--text:#e6e9ee;--dim:#8b95a3;
-  --known:#3ddc84;--unknown:#ff9f1a;--bad:#ff5c5c;--accent:#4aa3ff}
+  --known:#3ddc84;--unknown:#ff9f1a;--bad:#ff5c5c;--accent:#4aa3ff;--look:#3ddc84;--away:#ff4fd8}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,sans-serif}
 header{display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line)}
@@ -20,6 +20,8 @@ nav a[aria-current=page]{background:var(--accent);color:#000;font-weight:600}
 .seg button{background:transparent;color:var(--dim);border-radius:0;padding:4px 12px}
 .seg button+button{border-left:1px solid var(--line)}
 .seg button[aria-pressed=true]{background:var(--accent);color:#000;font-weight:600}
+.tog{background:transparent;color:var(--dim);border:1px solid var(--line);border-radius:6px;padding:4px 12px}
+.tog[aria-pressed=true]{background:var(--look);color:#000;border-color:var(--look);font-weight:600}
 #res{margin-left:auto;color:var(--dim);font-variant-numeric:tabular-nums}
 main{display:grid;grid-template-columns:minmax(0,1fr) 470px;gap:16px;max-width:1500px;margin:auto;padding:16px}
 @media (max-width:980px){main{grid-template-columns:minmax(0,1fr)}}
@@ -45,6 +47,15 @@ input[type=number]{width:5em;font:inherit;background:var(--bg);color:var(--text)
 a{color:var(--accent)}
 #msg{font-weight:600}
 #foot{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums}
+button.sec{background:#2a313c}
+.gz{display:grid;grid-template-columns:200px minmax(0,1fr);gap:12px;align-items:center;margin-bottom:8px}
+#gzc{width:200px;height:200px;background:var(--bg);border:1px solid var(--line);border-radius:6px}
+#gzbig{font-size:20px;font-weight:700}
+#gzbig.on{color:var(--look)}
+#gzbig.off{color:var(--away)}
+#gzsub{color:var(--dim);font-variant-numeric:tabular-nums}
+tr.look td:last-child{color:var(--look);font-weight:700}
+.note{color:var(--dim);font-size:12px;margin:6px 0 0}
 </style>
 
 <header>
@@ -55,6 +66,7 @@ a{color:var(--accent)}
     <button id="v-faces" aria-pressed="true" title="só a imagem de dentro de cada caixa (pouca banda)">Só os rostos</button>
     <button id="v-full" aria-pressed="false" title="o quadro inteiro da câmera, com as caixas">Imagem inteira</button>
   </div>
+  <button id="gz" class="tog" aria-pressed="false" title="rastreamento do olhar: pontos do rosto, pupilas e para onde a pessoa olha">Olhar</button>
   <span id="res"></span>
 </header>
 
@@ -64,6 +76,22 @@ a{color:var(--accent)}
     <p id="foot"></p>
   </div>
   <div>
+    <section id="gaze" hidden>
+      <h2>Olhar</h2>
+      <div class="gz">
+        <canvas id="gzc" width="400" height="400" aria-label="para onde cada rosto olha, visto da câmera"></canvas>
+        <div><div id="gzbig">–</div><div id="gzsub"></div></div>
+      </div>
+      <table>
+        <thead><tr><th>ID</th><th>olhar</th><th>cabeça</th><th>olhos</th><th>pupilas</th><th>câmera</th></tr></thead>
+        <tbody id="gzt"><tr><td colspan="6" class="none">nenhum rosto</td></tr></tbody>
+      </table>
+      <div class="row"><button id="gzcal">Calibrar</button><button class="sec" id="gzrst">Zerar</button><span id="gzmsg"></span></div>
+      <div class="row" id="gzcalv"></div>
+      <p class="note">Ângulos em graus vistos da câmera: horizontal &gt; 0 = para a direita da imagem, vertical &gt; 0
+        = para cima. Olhar = cabeça + olhos. Para calibrar, fique de frente, olhe para a lente e clique em
+        <b>Calibrar</b>. Pupilas só com o rosto perto (olhos a 24 px ou mais um do outro) e boa luz.</p>
+    </section>
     <section>
       <h2>Rostos na imagem</h2>
       <table>
@@ -107,7 +135,9 @@ const $ = id => document.getElementById(id);
 const cv = $('cv'), g = cv.getContext('2d'), q = $('q'), msg = $('msg');
 const KNOWN = '#3ddc84', UNKNOWN = '#ff9f1a';
 const STALE_MS = 700;           /* sem evento "faces" há mais que isso: caixas apagadas */
-const VIEW_KEY = 'face_app.view';
+const VIEW_KEY = 'face_app.view', GAZE_KEY = 'face_app.gaze';
+const LOOK = '#3ddc84', AWAY = '#ff4fd8', LOOK_DEG = 12, GZ_RANGE = 45;
+const gzc = $('gzc'), gg = gzc.getContext('2d');
 
 let W = cv.width, H = cv.height;
 let faces = [], frameT = 0, facesAt = 0, dirty = true, live = false;
@@ -121,6 +151,10 @@ let es = null, retry = 0;
  * "full": o quadro inteiro, pedido um a um ao /frame.jpg. Cada aba escolhe a sua. */
 let view = 'faces';
 try { if (localStorage.getItem(VIEW_KEY) === 'full') view = 'full'; } catch (e) {}
+/* Olhar: desenha pontos, pupilas e a seta do olhar e mostra o painel. Os
+ * dados vêm sempre nas caixas; o botão só muda o que aparece. */
+let gazeOn = false;
+try { gazeOn = localStorage.getItem(GAZE_KEY) === '1'; } catch (e) {}
 
 function setLive(on) {
   live = on;
@@ -226,7 +260,8 @@ function drawBox(f, font, lw, withCrop) {
     g.restore();
   }
   g.strokeStyle = color; g.lineWidth = lw; g.strokeRect(x0, y0, f.dx, f.dy);
-  g.beginPath(); g.moveTo(f.x - 12, f.y); g.lineTo(f.x + 12, f.y); g.moveTo(f.x, f.y - 12); g.lineTo(f.x, f.y + 12); g.stroke();
+  if (gazeOn && f.kp) drawGaze(f, lw);
+  else { g.beginPath(); g.moveTo(f.x - 12, f.y); g.lineTo(f.x + 12, f.y); g.moveTo(f.x, f.y - 12); g.lineTo(f.x, f.y + 12); g.stroke(); }
 
   const label = f.id >= 0 ? `ID ${f.id} · ${f.sim}%` : 'desconhecido';
   g.font = `600 ${font}px system-ui,sans-serif`;
@@ -234,6 +269,73 @@ function drawBox(f, font, lw, withCrop) {
   const ly = y0 - lh >= 0 ? y0 - lh : y0;
   g.fillStyle = color; g.fillRect(x0, ly, tw, lh);
   g.fillStyle = '#000'; g.textBaseline = 'top'; g.fillText(label, x0 + pad, ly + pad);
+}
+
+/* Pontos do rosto, pupilas e uma seta saindo do meio dos olhos para onde a
+ * pessoa olha (comprimento ~ 2,5x a distância entre os olhos). */
+function drawGaze(f, lw) {
+  const k = f.kp, [yaw, pitch] = f.g, color = f.look ? LOOK : AWAY;
+  const d = Math.hypot(k[2] - k[0], k[3] - k[1]), r = Math.max(2, d / 22);
+  g.fillStyle = 'rgba(255,255,255,.8)';
+  for (let i = 0; i < 10; i += 2) { g.beginPath(); g.arc(k[i], k[i + 1], r, 0, 7); g.fill(); }
+  g.strokeStyle = '#3ad7ff'; g.lineWidth = Math.max(1.5, lw / 1.5);
+  for (let i = 0; i < 4; i += 2) if (f.pu[i] >= 0) { g.beginPath(); g.arc(f.pu[i], f.pu[i + 1], r * 1.8, 0, 7); g.stroke(); }
+
+  const ex = (k[0] + k[2]) / 2, ey = (k[1] + k[3]) / 2, L = d * 2.5;
+  const tx = ex + Math.sin(yaw * Math.PI / 180) * L, ty = ey - Math.sin(pitch * Math.PI / 180) * L;
+  const a = Math.atan2(ty - ey, tx - ex), hl = Math.max(8, d / 4);
+  g.strokeStyle = color; g.fillStyle = color; g.lineWidth = lw;
+  g.beginPath(); g.moveTo(ex, ey); g.lineTo(tx, ty); g.stroke();
+  if (Math.hypot(tx - ex, ty - ey) > hl) {
+    g.beginPath(); g.moveTo(tx, ty);
+    g.lineTo(tx - hl * Math.cos(a - .45), ty - hl * Math.sin(a - .45));
+    g.lineTo(tx - hl * Math.cos(a + .45), ty - hl * Math.sin(a + .45)); g.fill();
+  } else { g.beginPath(); g.arc(ex, ey, r * 2.5, 0, 7); g.fill(); }
+}
+
+function dirText(yaw, pitch) {
+  const h = yaw > LOOK_DEG ? 'direita' : yaw < -LOOK_DEG ? 'esquerda' : '';
+  const v = pitch > LOOK_DEG ? 'cima' : pitch < -LOOK_DEG ? 'baixo' : '';
+  return h && v ? `${v} e ${h}` : h || v || 'perto da câmera';
+}
+
+const deg = (a, b) => `${a.toFixed(0)}° / ${b.toFixed(0)}°`;
+
+/* Painel do olhar: alvo visto da câmera (centro = olhando para ela, círculo
+ * = LOOK_DEG), o ponto cheio é o olhar e o vazado só a cabeça. */
+function drawGazePanel(list) {
+  const S = gzc.width, c = S / 2, px = v => c + Math.max(-1, Math.min(1, v / GZ_RANGE)) * (c - 10);
+  const py = v => c - Math.max(-1, Math.min(1, v / GZ_RANGE)) * (c - 10);
+  gg.clearRect(0, 0, S, S);
+  gg.strokeStyle = 'rgba(255,255,255,.08)'; gg.lineWidth = 1; gg.beginPath();
+  for (let a = -30; a <= 30; a += 15) { gg.moveTo(px(a), 0); gg.lineTo(px(a), S); gg.moveTo(0, py(a)); gg.lineTo(S, py(a)); }
+  gg.stroke();
+  gg.strokeStyle = 'rgba(61,220,132,.55)'; gg.lineWidth = 2;
+  gg.beginPath(); gg.arc(c, c, px(LOOK_DEG) - c, 0, 7); gg.stroke();
+  gg.fillStyle = 'rgba(255,255,255,.35)'; gg.font = '20px system-ui,sans-serif'; gg.textAlign = 'center';
+  gg.fillText('câmera', c, c + px(LOOK_DEG) - c + 24);
+  for (const f of list) {
+    if (!f.g) continue;
+    const [yaw, pitch, hy, hp] = f.g, color = f.look ? LOOK : AWAY;
+    gg.strokeStyle = color; gg.lineWidth = 3;
+    gg.beginPath(); gg.arc(px(hy), py(hp), 9, 0, 7); gg.stroke();
+    gg.beginPath(); gg.moveTo(px(hy), py(hp)); gg.lineTo(px(yaw), py(pitch)); gg.stroke();
+    gg.fillStyle = color; gg.beginPath(); gg.arc(px(yaw), py(pitch), 14, 0, 7); gg.fill();
+    gg.fillStyle = '#000'; gg.font = '600 16px system-ui,sans-serif'; gg.textBaseline = 'middle';
+    gg.fillText(f.id >= 0 ? f.id : '?', px(yaw), py(pitch) + 1);
+    gg.textBaseline = 'alphabetic';
+  }
+  gg.textAlign = 'start';
+
+  const main = list.find(f => f.g);
+  $('gzbig').className = main ? (main.look ? 'on' : 'off') : '';
+  $('gzbig').textContent = !main ? 'nenhum rosto' : main.look ? 'olhando para a câmera' : 'olhando para ' + dirText(main.g[0], main.g[1]);
+  $('gzsub').textContent = main ? `olhar ${deg(main.g[0], main.g[1])} · ` + (main.eyes ? 'pupilas ok' : 'sem pupilas: só a cabeça') : '';
+  $('gzt').innerHTML = list.length ? list.map(f => !f.g ? '' :
+    `<tr class="${f.id >= 0 ? 'k' : 'u'}${f.look ? ' look' : ''}"><td>${f.id}</td><td>${deg(f.g[0], f.g[1])}</td>` +
+    `<td>${deg(f.g[2], f.g[3])}</td><td>${f.eyes ? deg(f.g[4], f.g[5]) : '—'}</td>` +
+    `<td>${(f.pu[0] >= 0) + (f.pu[2] >= 0)}/2</td><td>${f.look ? 'sim' : 'não'}</td></tr>`).join('')
+    : `<tr><td colspan="6" class="none">${live ? 'nenhum rosto' : 'sem conexão'}</td></tr>`;
 }
 
 function draw() {
@@ -268,6 +370,7 @@ function draw() {
     }
   }
   table(shown);
+  if (gazeOn) drawGazePanel(view === 'full' && frame ? frame.f : shown);
 }
 
 function table(list) {
@@ -285,6 +388,11 @@ function stats(s) {
   if (s.width !== W || s.height !== H) { W = cv.width = s.width; H = cv.height = s.height; dirty = true; }
   $('res').textContent = `${s.width}×${s.height}`;
   $('ids').textContent = s.enrolled.length ? s.enrolled.join(', ') : 'nenhum';
+  if (s.gaze_cal) {
+    const c = s.gaze_cal;
+    $('gzcalv').textContent = c.every(v => v === 0) ? 'sem calibração'
+      : `calibração: cabeça ${deg(c[0], c[1])} · olhos ${deg(c[2], c[3])}`;
+  }
   if (!prev) { q.value = s.quality; $('qv').textContent = s.quality; }
   const dt = prev ? (s.uptime_ms - prev.uptime_ms) / 1000 : 0;
   if (dt > 0) {
@@ -326,11 +434,33 @@ $('clr').onclick = async () => {
   const j = await post('/delete?id=all'); msg.textContent = j.ok ? 'todos apagados' : j.error;
 };
 
+function showGaze() {
+  $('gz').setAttribute('aria-pressed', gazeOn);
+  $('gaze').hidden = !gazeOn;
+  dirty = true;
+}
+$('gz').onclick = () => {
+  gazeOn = !gazeOn;
+  try { localStorage.setItem(GAZE_KEY, gazeOn ? '1' : '0'); } catch (e) {}
+  showGaze();
+};
+$('gzcal').onclick = async () => {
+  $('gzmsg').textContent = 'olhe para a lente…';
+  await sleep(800);   /* tempo de olhar para a câmera depois de clicar */
+  try { const j = await post('/gaze/calib'); $('gzmsg').textContent = j.ok ? 'calibrado' : j.error; }
+  catch (e) { $('gzmsg').textContent = 'sem resposta da placa'; }
+};
+$('gzrst').onclick = async () => {
+  try { const j = await post('/gaze/calib?reset=1'); $('gzmsg').textContent = j.ok ? 'calibração zerada' : j.error; }
+  catch (e) { $('gzmsg').textContent = 'sem resposta da placa'; }
+};
+
 $('v-faces').onclick = () => setView('faces');
 $('v-full').onclick = () => setView('full');
 
 setInterval(() => { dirty = true; }, 250);   /* apaga caixas paradas e mantém a tabela em dia */
 showView();
+showGaze();
 connect();
 startFrames();
 draw();

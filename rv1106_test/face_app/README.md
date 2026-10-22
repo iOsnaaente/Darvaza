@@ -66,7 +66,7 @@ da placa (cada aba escolhe a sua, e o navegador lembra):
 
 | | |
 | --- | --- |
-| `GET /` | caixas ao vivo com o rosto dentro, tabela dos rostos, desempenho, cadastro |
+| `GET /` | caixas ao vivo com o rosto dentro, tabela dos rostos, desempenho, cadastro, olhar |
 | `GET /events` | Server-Sent Events: `faces`, `crop`, `stats` (como no P4) |
 | `GET /events?view=full` | o mesmo, sem `crop` (a imagem inteira vem do `/frame.jpg`) |
 | `GET /frame.jpg?after=N` | o próximo quadro inteiro depois do de número N, em JPEG; cabeçalhos `X-Frame-Seq` (número dele), `X-Frame-T` (ms desde o boot em que foi capturado) e `X-Faces` (as caixas dele, como no evento `faces`) |
@@ -75,11 +75,58 @@ da placa (cada aba escolhe a sua, e o navegador lembra):
 | `GET /quality?q=N` | qualidade JPEG dos recortes e da foto |
 | `POST /enroll` | cadastra o maior rosto na imagem e devolve o ID |
 | `POST /delete?id=N` | apaga um ID (`id=all` apaga todos) |
+| `POST /gaze/calib` | o maior rosto, olhando para a câmera, vira olhar 0°,0° (`?reset=1` tira a calibração) |
 
 Caixa **verde** com `ID n · xx%` = reconhecido; **laranja** `desconhecido` =
 rosto sem cadastro. Cadastrar quem já está cadastrado devolve o ID existente.
 Os cadastros ficam em `/userdata/faces.bin` e sobrevivem a reboot; só somem
 apagando pela página ou regravando a placa.
+
+## Olhar
+
+O botão **Olhar** no topo da página liga o rastreamento do olhar (o
+navegador lembra; funciona em **Só os rostos** e em **Imagem inteira**). Em
+cada rosto aparecem os 5 pontos do RetinaFace, as pupilas (círculo azul) e
+uma seta saindo do meio dos olhos para onde a pessoa olha: **verde** =
+olhando para a câmera (a menos de 12° dela), **rosa** = olhando para outro
+lado. O painel **Olhar** mostra um alvo visto da câmera (ponto cheio = olhar,
+círculo vazado = só a cabeça), a tabela por rosto e a calibração.
+
+Para calibrar: de frente, olhe para a lente e clique em **Calibrar** (a
+página espera ~1 s antes de medir). A correção vale para todos os rostos até
+o app reiniciar; **Zerar** volta ao modelo sem correção.
+
+Os dados vêm sempre, para todo rosto, no evento `faces`, no `X-Faces` e no
+`/status` (o botão só muda o que a página desenha):
+
+| campo | |
+| --- | --- |
+| `g` | `[olhar_yaw, olhar_pitch, cabeça_yaw, cabeça_pitch, olhos_yaw, olhos_pitch]`, graus vistos da câmera: yaw > 0 = para a direita da imagem, pitch > 0 = para cima; olhar = cabeça + olhos |
+| `look` | 1 = olhando para a câmera |
+| `eyes` | 1 = achou ao menos uma pupila neste quadro (senão os olhos ficam com o último valor) |
+| `pu` | pupilas `[xe, ye, xd, yd]` em pixels do quadro, -1 = não achou |
+| `kp` | os 5 pontos: olho esquerdo e direito da imagem, nariz, cantos da boca |
+| `gaze_cal` | (só no `/status`) correção atual: cabeça yaw, pitch; olhos yaw, pitch |
+
+Como é medido (`gaze.cpp`, ~0,1 ms por rosto na CPU, sem modelo novo):
+
+- **Cabeça**: um rosto 3D médio (nariz à frente dos olhos, boca abaixo). O
+  nariz anda para o lado em relação aos olhos quando a cabeça gira (yaw) e
+  sobe ou desce em relação à boca quando ela inclina (pitch). Tudo em
+  unidades da distância entre os olhos: não depende da distância à câmera
+  nem do rosto inclinado de lado.
+- **Olhos**: numa janelinha em volta de cada olho, no plano Y (cinza) do
+  próprio buffer da câmera, os 12% de pixels mais escuros (íris/pupila) dão o
+  centro da pupila; o deslocamento dela em relação ao ponto do olho vira o
+  giro do globo ocular. Só com os olhos a 24 px ou mais um do outro (rosto a
+  ~1,5 m ou menos em 1280x960); olho fechado ou escuro demais = sem pupila.
+- Média móvel por rosto (track), calibração descontada ao publicar.
+
+Limites: é uma estimativa geométrica, não um modelo treinado de olhar. A
+cabeça é a parte confiável (±5–10° depois de calibrar); os olhos dependem de
+luz e de resolução, e o ponto do olho do RetinaFace acompanha um pouco a
+pupila, o que reduz o sinal (`EYE_GAIN` em `gaze.cpp` compensa). O vertical
+dos olhos é o mais fraco (pálpebras). Óculos com reflexo atrapalham a pupila.
 
 ## Terminal
 
@@ -111,7 +158,8 @@ conhecido (re-verifica a cada 500 ms), até 2 por quadro.
   160x160 com borda cinza numa transformação só, em RGB; MobileFaceNet na NPU
   (~4,4 ms) dá um vetor de 128 posições comparado por cosseno.
 - **IA** (`face.cpp`): tracking por IoU, agendamento e cadastro iguais aos
-  do P4, numa thread que analisa sempre o quadro mais novo.
+  do P4, numa thread que analisa sempre o quadro mais novo. O olhar
+  (`gaze.cpp`) é medido ali mesmo, em todo rosto de todo quadro.
 - **Web** (`main.cpp`, `http.cpp`): recortes JPEG por hardware (MPP) até 15
   por segundo, só com alguém na página; SSE com no máximo 2 espectadores.
 - **Imagem inteira** (`main.cpp`): só codifica quadro pedido. Um pedido ao

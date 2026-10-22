@@ -18,6 +18,7 @@
 #include <string>
 
 #include "camera.h"
+#include "gaze.h"
 
 #define FACE_MAX_BOXES 4
 
@@ -29,6 +30,10 @@ struct face_box_t {
     uint8_t sim_pct;          /* semelhança com o cadastro, 0-100 */
     uint32_t track;           /* o mesmo enquanto este rosto é seguido */
     int64_t since_us;         /* quando ele apareceu (now_us) */
+    int16_t kp[10];           /* os 5 pontos do RetinaFace (Det::kp), em pixels do quadro */
+    gaze_t gaze;              /* cabeça e olhos, já com a calibração (gaze.h) */
+    float yaw, pitch;         /* olhar = cabeça + olhos, em graus */
+    bool look;                /* olhando para a câmera */
 };
 
 /* O que a IA achou num quadro. */
@@ -91,3 +96,11 @@ int face_delete(int id);
 size_t face_list(int *ids, size_t max);
 
 void face_get_stats(face_stats_t *out);
+
+/* Calibra o olhar: o maior rosto na imagem, olhando para a câmera, passa a
+ * ser yaw = pitch = 0 (cabeça e olhos). reset = volta para sem calibração.
+ * false = nenhum rosto. Vale até o app reiniciar. */
+bool face_gaze_calibrate(bool reset);
+
+/* Correção atual, em graus: cabeça yaw, pitch; olhos yaw, pitch. */
+void face_gaze_offsets(float out[4]);

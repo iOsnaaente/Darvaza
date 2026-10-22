@@ -42,6 +42,9 @@ static const char *TAG = "face";
 #define MAX_RECOG_PER_FRAME 2
 #define SUMMARY_US          (5 * 1000 * 1000)  /* linha "#" de resumo no terminal */
 
+/* Olhar: "para a câmera" = olhar a menos disso do centro, em graus. */
+#define GAZE_LOOK_DEG       12.0f
+
 static float s_thr;
 
 /* ---- Cadastros --------------------------------------------------------------- */
@@ -194,6 +197,9 @@ struct track_t {
     int64_t since_us;       /* quadro em que o rosto apareceu */
     uint32_t gen;           /* muda quando o slot é reaproveitado por outro rosto */
     bool live;
+    int kp[10];             /* pontos do rosto no último quadro */
+    gaze_t gaze;            /* suavizado, sem calibração */
+    bool gaze_ok;           /* gaze já tem uma medida */
 };
 
 static track_t s_tracks[MAX_TRACKS];
@@ -250,6 +256,7 @@ static void associate(const std::vector<Det> &dets, int *track_of, int64_t frame
         if (best >= 0) {
             matched[best] = true;
             memcpy(s_tracks[best].box, box, sizeof(s_tracks[best].box));
+            memcpy(s_tracks[best].kp, dets[i].kp, sizeof(s_tracks[best].kp));
             s_tracks[best].missed = 0;
         }
     }
@@ -291,20 +298,37 @@ static std::mutex s_res_lock;
 static face_result_t s_res;
 static int64_t s_res_time;
 static face_stats_t s_stats;
+static float s_gaze_off[4];   /* calibração: cabeça yaw, pitch; olhos yaw, pitch */
 
 static void publish(int64_t frame_us)
 {
     face_result_t out = {};
+    std::lock_guard<std::mutex> lock(s_res_lock);
     for (int j = 0; j < MAX_TRACKS && out.n < FACE_MAX_BOXES; j++) {
         const track_t &t = s_tracks[j];
-        if (t.live) {
-            out.box[out.n++] = {(int16_t)t.box[0], (int16_t)t.box[1], (int16_t)t.box[2], (int16_t)t.box[3],
-                                (int16_t)t.id, (uint8_t)std::clamp((int)(t.sim * 100), 0, 100), t.gen,
-                                t.since_us};
+        if (!t.live) {
+            continue;
         }
+        face_box_t &b = out.box[out.n++];
+        b.x0 = (int16_t)t.box[0];
+        b.y0 = (int16_t)t.box[1];
+        b.x1 = (int16_t)t.box[2];
+        b.y1 = (int16_t)t.box[3];
+        b.id = (int16_t)t.id;
+        b.sim_pct = (uint8_t)std::clamp((int)(t.sim * 100), 0, 100);
+        b.track = t.gen;
+        b.since_us = t.since_us;
+        std::copy(t.kp, t.kp + 10, b.kp);
+        b.gaze = t.gaze;
+        b.gaze.head_yaw -= s_gaze_off[0];
+        b.gaze.head_pitch -= s_gaze_off[1];
+        b.gaze.eye_yaw -= s_gaze_off[2];
+        b.gaze.eye_pitch -= s_gaze_off[3];
+        b.yaw = b.gaze.head_yaw + b.gaze.eye_yaw;
+        b.pitch = b.gaze.head_pitch + b.gaze.eye_pitch;
+        b.look = std::hypot(b.yaw, b.pitch) < GAZE_LOOK_DEG;
     }
     out.frame_us = frame_us;
-    std::lock_guard<std::mutex> lock(s_res_lock);
     out.seq = s_res.seq + 1;
     s_res = out;
     s_res_time = now_us();
@@ -446,6 +470,16 @@ static void ai_thread()
 
         int track_of[MAX_TRACKS];
         associate(dets, track_of, frame_us);
+
+        for (size_t i = 0; i < dets.size(); i++) {
+            if (track_of[i] >= 0) {
+                track_t &t = s_tracks[track_of[i]];
+                gaze_t m;
+                gaze_measure(*img, dets[i].kp, &m);
+                gaze_smooth(t.gaze, m, !t.gaze_ok);
+                t.gaze_ok = true;
+            }
+        }
 
         for (int n = 0; n < MAX_RECOG_PER_FRAME; n++) {
             bool enroll;
@@ -626,4 +660,41 @@ void face_get_stats(face_stats_t *out)
 {
     std::lock_guard<std::mutex> lock(s_res_lock);
     *out = s_stats;
+}
+
+bool face_gaze_calibrate(bool reset)
+{
+    std::lock_guard<std::mutex> lock(s_res_lock);
+    if (reset) {
+        std::fill(s_gaze_off, s_gaze_off + 4, 0.0f);
+        LOGI(TAG, "olhar: calibração zerada");
+        return true;
+    }
+    /* O resultado publicado já vem descontado da correção atual: soma o que
+     * sobrou nele. */
+    const face_box_t *big = nullptr;
+    for (size_t i = 0; i < s_res.n; i++) {
+        const face_box_t &b = s_res.box[i];
+        if (!big || (b.x1 - b.x0) > (big->x1 - big->x0)) {
+            big = &b;
+        }
+    }
+    if (!big || now_us() - s_res_time > 600 * 1000) {
+        return false;
+    }
+    s_gaze_off[0] += big->gaze.head_yaw;
+    s_gaze_off[1] += big->gaze.head_pitch;
+    if (big->gaze.eyes) {
+        s_gaze_off[2] += big->gaze.eye_yaw;
+        s_gaze_off[3] += big->gaze.eye_pitch;
+    }
+    LOGI(TAG, "olhar calibrado: cabeça %.1f/%.1f, olhos %.1f/%.1f graus%s", s_gaze_off[0], s_gaze_off[1],
+         s_gaze_off[2], s_gaze_off[3], big->gaze.eyes ? "" : " (sem pupila: olhos não calibrados)");
+    return true;
+}
+
+void face_gaze_offsets(float out[4])
+{
+    std::lock_guard<std::mutex> lock(s_res_lock);
+    std::copy(s_gaze_off, s_gaze_off + 4, out);
 }

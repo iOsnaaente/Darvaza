@@ -18,6 +18,8 @@
  *   GET  /quality?q=N   qualidade JPEG ao vivo (1..100)
  *   POST /enroll        cadastra o maior rosto da imagem; devolve o ID
  *   POST /delete?id=N   apaga um cadastro (id=all apaga todos)
+ *   POST /gaze/calib    o maior rosto, olhando para a câmera, vira o olhar 0,0
+ *                       (?reset=1 tira a calibração)
  *   GET  /asr ...       medição de reconhecimento de fala (asr.h)
  *
  * Pipeline: sensor -> ISP + 3A (rkaiq) -> VI NV12 1280x960 (camera.cpp) -> IA
@@ -460,16 +462,26 @@ static void send_json(int fd, const char *status, const char *body)
     http_respond(fd, status ? status : "200 OK", "application/json; charset=utf-8", body);
 }
 
-/* [{"trk","id","sim","x","y","dx","dy","age"}, ...]: x,y,dx,dy como no
- * terminal (face.h); age = ms desde que o rosto apareceu. */
+/* [{"trk","id","sim","x","y","dx","dy","age","kp","g","look","eyes","pu"}, ...]:
+ * x,y,dx,dy como no terminal (face.h); age = ms desde que o rosto apareceu;
+ * kp = os 5 pontos (x,y) do rosto; g = olhar yaw, pitch, cabeça yaw, pitch,
+ * olhos yaw, pitch, em graus (gaze.h); look = olhando para a câmera; eyes =
+ * achou a pupila; pu = pupilas xe,ye,xd,yd (-1 = não achou). */
 static void faces_json(std::string &s, const face_result_t &r)
 {
     s += "[";
     for (size_t i = 0; i < r.n; i++) {
         const face_box_t *b = &r.box[i];
-        appendf(s, "%s{\"trk\":%u,\"id\":%d,\"sim\":%u,\"x\":%d,\"y\":%d,\"dx\":%d,\"dy\":%d,\"age\":%lld}",
+        const gaze_t &g = b->gaze;
+        appendf(s, "%s{\"trk\":%u,\"id\":%d,\"sim\":%u,\"x\":%d,\"y\":%d,\"dx\":%d,\"dy\":%d,\"age\":%lld,\"kp\":[",
                 i ? "," : "", b->track, b->id, b->sim_pct, (b->x0 + b->x1) / 2, (b->y0 + b->y1) / 2, b->x1 - b->x0,
                 b->y1 - b->y0, (long long)((r.frame_us - b->since_us) / 1000));
+        for (int k = 0; k < 10; k++) {
+            appendf(s, "%s%d", k ? "," : "", b->kp[k]);
+        }
+        appendf(s, "],\"g\":[%.1f,%.1f,%.1f,%.1f,%.1f,%.1f],\"look\":%d,\"eyes\":%d,\"pu\":[%d,%d,%d,%d]}", b->yaw,
+                b->pitch, g.head_yaw, g.head_pitch, g.eye_yaw, g.eye_pitch, b->look, g.eyes, g.pupil[0], g.pupil[1],
+                g.pupil[2], g.pupil[3]);
     }
     s += "]";
 }
@@ -498,6 +510,10 @@ static void status_json(std::string &s)
             ai.cycles, s_ai_paused ? "true" : "false", ai.detect_us, ai.latency_us, ai.recogs, ai.recog_us,
             (unsigned long long)mem_available(), (long long)(res.frame_us / 1000));
     faces_json(s, res);
+
+    float off[4];
+    face_gaze_offsets(off);
+    appendf(s, ",\"gaze_cal\":[%.1f,%.1f,%.1f,%.1f]", off[0], off[1], off[2], off[3]);
 
     int ids[64];
     size_t total = face_list(ids, sizeof(ids) / sizeof(ids[0]));
@@ -761,6 +777,16 @@ static void delete_handler(HttpRequest &req)
     send_json(req.fd, nullptr, "{\"ok\":true}");
 }
 
+static void gaze_calib_handler(HttpRequest &req)
+{
+    std::string val;
+    const bool reset = http_query_value(req.query, "reset", val) && val == "1";
+    if (!face_gaze_calibrate(reset)) {
+        return send_json(req.fd, "409 Conflict", "{\"ok\":false,\"error\":\"nenhum rosto na imagem\"}");
+    }
+    send_json(req.fd, nullptr, "{\"ok\":true}");
+}
+
 static bool start_server(int port)
 {
     static HttpServer server;
@@ -772,6 +798,7 @@ static bool start_server(int port)
     server.on("GET", "/quality", quality_handler);
     server.on("POST", "/enroll", enroll_handler);
     server.on("POST", "/delete", delete_handler);
+    server.on("POST", "/gaze/calib", gaze_calib_handler);
     asr_routes(server);
     /* O navegador sempre pede; 204 evita um 404 a cada visita. */
     server.on("GET", "/favicon.ico", [](HttpRequest &req) {
